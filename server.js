@@ -5,7 +5,7 @@
  *  1. Serves the chat UI (public/index.html)
  *  2. Connects to Gemini AI as a conversational agent
  *  3. Collects booking details through natural conversation
- *  4. Triggers browser automation via OpenClaw/Playwright CDP
+ *  4. Triggers browser automation via Playwright over Chrome CDP (port 9222)
  *  5. Sends real-time progress updates over WebSocket
  *
  * Usage:
