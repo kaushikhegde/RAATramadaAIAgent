@@ -1,0 +1,54 @@
+# ─────────────────────────────────────────────────────────────
+# RAA Travel Booking Chatbot — Docker Compose
+# ─────────────────────────────────────────────────────────────
+#
+# USAGE:
+#   docker compose up --build
+#   Chatbot UI:      http://localhost:3000
+#   Live browser:    http://localhost:6080/vnc.html
+#
+# Uses stealth Chromium inside Docker (puppeteer-extra + rebrowser-patches)
+# to bypass Akamai bot detection on Jetstar.
+# ─────────────────────────────────────────────────────────────
+version: "3.8"
+
+services:
+  chatbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: raa-travel-chatbot
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"       # Chatbot UI + WebSocket
+      - "${VNC_PORT:-6080}:6080"   # noVNC browser viewer (internal mode only)
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - PORT=3000
+      - DEBUG=${DEBUG:-true}
+      - OPENCLAW_GATEWAY_URL=${OPENCLAW_GATEWAY_URL:-}
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-}
+      - NODE_ENV=production
+      - RESOLUTION=${RESOLUTION:-1280x900x24}
+      # CDP_MODE: "internal" (default) = stealth Chromium inside Docker
+      #           "external" = connect to host Chrome on port 9222
+      - CDP_MODE=${CDP_MODE:-internal}
+      - CDP_HOST=${CDP_HOST:-host.docker.internal}
+      - CDP_PORT=${CDP_PORT:-9222}
+    volumes:
+      # Persist screenshots between restarts
+      - ./completed:/app/completed
+    # Allow container to reach host machine's Chrome
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Chromium needs extra shared memory for rendering
+    shm_size: "2gb"
+    # Security: Chromium needs these to run in Docker
+    cap_add:
+      - SYS_ADMIN
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

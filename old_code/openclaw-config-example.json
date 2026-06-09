@@ -1,0 +1,12 @@
+{
+  "_comment": "Copy the relevant sections into your ~/.openclaw/openclaw.json (or wherever OPENCLAW_CONFIG_DIR points)",
+  "auth": {
+    "token": "8fc9ad042c4a2e7cb56f0b2010f4e569"
+  },
+  "gateway": {
+    "tools": {
+      "allow": ["*"],
+      "deny": []
+    }
+  }
+}

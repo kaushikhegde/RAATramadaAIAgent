@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tramada Booking Search</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #f0f2f5;
+      color: #333;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px;
+    }
+    h1 {
+      margin: 20px 0 10px;
+      color: #2c3e50;
+      font-size: 1.8rem;
+    }
+    .subtitle {
+      color: #7f8c8d;
+      margin-bottom: 30px;
+      font-size: 0.95rem;
+    }
+    .card {
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+      padding: 30px;
+      width: 100%;
+      max-width: 600px;
+      margin-bottom: 20px;
+    }
+    .form-group {
+      margin-bottom: 18px;
+    }
+    label {
+      display: block;
+      margin-bottom: 6px;
+      font-weight: 600;
+      color: #34495e;
+      font-size: 0.9rem;
+    }
+    input[type="text"], input[type="password"] {
+      width: 100%;
+      padding: 10px 14px;
+      border: 2px solid #e0e0e0;
+      border-radius: 8px;
+      font-size: 1rem;
+      transition: border-color 0.2s;
+    }
+    input:focus {
+      outline: none;
+      border-color: #3498db;
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      background: #2980b9;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 1.05rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+      margin-top: 10px;
+    }
+    button:hover { background: #2471a3; }
+    button:disabled {
+      background: #bdc3c7;
+      cursor: not-allowed;
+    }
+    .progress-bar {
+      width: 100%;
+      height: 8px;
+      background: #ecf0f1;
+      border-radius: 4px;
+      overflow: hidden;
+      margin: 15px 0;
+      display: none;
+    }
+    .progress-bar.active { display: block; }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #3498db, #2ecc71);
+      border-radius: 4px;
+      transition: width 0.5s ease;
+      width: 0%;
+    }
+    .status {
+      padding: 10px 14px;
+      background: #f8f9fa;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      color: #555;
+      margin-top: 10px;
+      display: none;
+    }
+    .status.active { display: block; }
+    .status.error {
+      background: #fde8e8;
+      color: #c0392b;
+    }
+    .status.success {
+      background: #e8f8e8;
+      color: #27ae60;
+    }
+    .results-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 15px;
+      font-size: 0.85rem;
+    }
+    .results-table th {
+      background: #2c3e50;
+      color: white;
+      padding: 10px 8px;
+      text-align: left;
+      font-weight: 600;
+    }
+    .results-table td {
+      padding: 8px;
+      border-bottom: 1px solid #ecf0f1;
+    }
+    .results-table tr:hover {
+      background: #f5f7fa;
+    }
+    .results-count {
+      font-weight: 600;
+      color: #2c3e50;
+      margin: 15px 0 5px;
+    }
+    .screenshot-container {
+      margin-top: 15px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .screenshot-container img {
+      width: 100%;
+      display: block;
+    }
+    .novnc-link {
+      display: inline-block;
+      margin-top: 10px;
+      color: #3498db;
+      text-decoration: none;
+      font-size: 0.9rem;
+    }
+    .novnc-link:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <h1>Tramada Booking Search</h1>
+  <p class="subtitle">Search for bookings with status "Booked" in Tramada TTMS</p>
+
+  <div class="card" id="loginCard">
+    <div class="form-group">
+      <label for="username">Tramada Username</label>
+      <input type="text" id="username" placeholder="Enter your username" autocomplete="username">
+    </div>
+    <div class="form-group">
+      <label for="password">Tramada Password</label>
+      <input type="password" id="password" placeholder="Enter your password" autocomplete="current-password">
+    </div>
+    <button id="searchBtn" onclick="startSearch()">Search Booked Bookings</button>
+
+    <div class="progress-bar" id="progressBar">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+    <div class="status" id="statusMsg"></div>
+  </div>
+
+  <div class="card" id="resultsCard" style="display:none;">
+    <h2 style="margin-bottom:10px; color:#2c3e50;">Search Results</h2>
+    <div id="resultsCount" class="results-count"></div>
+    <div id="resultsBody"></div>
+    <div id="screenshotContainer" class="screenshot-container" style="display:none;">
+      <img id="screenshotImg" alt="Tramada search results screenshot">
+    </div>
+  </div>
+
+  <a class="novnc-link" href="http://localhost:6080/vnc.html" target="_blank">
+    Open noVNC to watch browser live →
+  </a>
+
+  <script>
+    async function startSearch() {
+      const username = document.getElementById('username').value.trim();
+      const password = document.getElementById('password').value.trim();
+
+      if (!username || !password) {
+        showStatus('Please enter both username and password.', 'error');
+        return;
+      }
+
+      const btn = document.getElementById('searchBtn');
+      btn.disabled = true;
+      btn.textContent = 'Searching...';
+
+      showProgress(5);
+      showStatus('Starting Tramada automation...');
+
+      try {
+        const resp = await fetch('/api/tramada/search-booked', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password }),
+        });
+
+        const data = await resp.json();
+
+        if (!resp.ok) {
+          throw new Error(data.error || 'Search failed');
+        }
+
+        showProgress(100);
+        showStatus(`Found ${data.results.total} bookings with status "Booked"`, 'success');
+        displayResults(data);
+
+      } catch (err) {
+        showStatus(`Error: ${err.message}`, 'error');
+        showProgress(0);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Search Booked Bookings';
+      }
+    }
+
+    function showProgress(pct) {
+      const bar = document.getElementById('progressBar');
+      const fill = document.getElementById('progressFill');
+      bar.classList.add('active');
+      fill.style.width = pct + '%';
+    }
+
+    function showStatus(msg, type = '') {
+      const el = document.getElementById('statusMsg');
+      el.textContent = msg;
+      el.className = 'status active' + (type ? ` ${type}` : '');
+    }
+
+    function displayResults(data) {
+      const card = document.getElementById('resultsCard');
+      card.style.display = 'block';
+
+      const countEl = document.getElementById('resultsCount');
+      countEl.textContent = `${data.results.total} booking(s) found`;
+
+      const body = document.getElementById('resultsBody');
+
+      if (data.results.bookings.length === 0) {
+        body.innerHTML = '<p style="color:#7f8c8d; padding:10px 0;">No bookings found with status "Booked".</p>';
+      } else {
+        let html = `<table class="results-table">
+          <thead>
+            <tr>
+              <th>Bkg No</th>
+              <th>Client Name</th>
+              <th>Debtor Name</th>
+              <th>Itinerary</th>
+              <th>Dep. Date</th>
+              <th>Ret. Date</th>
+              <th>Final TKT</th>
+            </tr>
+          </thead>
+          <tbody>`;
+
+        data.results.bookings.forEach(b => {
+          html += `<tr>
+            <td>${b.bookingNo}</td>
+            <td>${b.clientName}</td>
+            <td>${b.debtorName}</td>
+            <td>${b.itinerary}</td>
+            <td>${b.depDate}</td>
+            <td>${b.retDate}</td>
+            <td>${b.finalTkt}</td>
+          </tr>`;
+        });
+
+        html += '</tbody></table>';
+        body.innerHTML = html;
+      }
+
+      // Show screenshot if available
+      if (data.screenshot) {
+        const container = document.getElementById('screenshotContainer');
+        const img = document.getElementById('screenshotImg');
+        img.src = 'data:image/png;base64,' + data.screenshot;
+        container.style.display = 'block';
+      }
+
+      // Scroll to results
+      card.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    // Allow Enter key to submit
+    document.getElementById('password').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') startSearch();
+    });
+  </script>
+</body>
+</html>

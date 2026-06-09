@@ -1,0 +1,1108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RAA Travel — Flight Booking Assistant</title>
+<style>
+  :root {
+    --raa-yellow: #FFE600;
+    --raa-yellow-hover: #E6CF00;
+    --raa-black: #1D1D1B;
+    --raa-dark: #262626;
+    --raa-charcoal: #434343;
+    --raa-warm-grey: #E8E2D3;
+    --raa-light-bg: #F7F5F0;
+    --raa-white: #FFFFFF;
+    --raa-grey-border: #D9D5CC;
+    --raa-text: #1D1D1B;
+    --raa-text-light: #6B6B6B;
+  }
+
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--raa-light-bg);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── Header ── */
+  .header {
+    background: var(--raa-white);
+    color: var(--raa-black);
+    padding: 0 24px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    height: 56px;
+    border-bottom: 3px solid var(--raa-yellow);
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+    flex-shrink: 0;
+    z-index: 10;
+  }
+
+  .header-logo {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+  }
+
+  .header-logo .logo-arrow {
+    width: 0;
+    height: 0;
+    border-top: 10px solid transparent;
+    border-bottom: 10px solid transparent;
+    border-left: 14px solid var(--raa-yellow);
+  }
+
+  .header-logo .logo-text {
+    font-size: 24px;
+    font-weight: 800;
+    letter-spacing: 2px;
+    color: var(--raa-black);
+  }
+
+  .header-divider {
+    width: 1px;
+    height: 28px;
+    background: var(--raa-grey-border);
+    margin: 0 4px;
+  }
+
+  .header h1 {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--raa-charcoal);
+  }
+
+  .header-right {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .header .status {
+    font-size: 11px;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-weight: 500;
+    background: var(--raa-light-bg);
+    color: var(--raa-text-light);
+  }
+
+  .header .status.connected {
+    background: #E8F5E9;
+    color: #2E7D32;
+  }
+
+  .header .status.disconnected {
+    background: #FFEBEE;
+    color: #C62828;
+  }
+
+  .browser-toggle {
+    padding: 5px 14px;
+    border: 1.5px solid var(--raa-grey-border);
+    background: var(--raa-white);
+    color: var(--raa-text);
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-family: inherit;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .browser-toggle:hover {
+    border-color: var(--raa-yellow);
+    background: rgba(255, 230, 0, 0.06);
+  }
+
+  .browser-toggle.active {
+    border-color: var(--raa-yellow);
+    background: var(--raa-yellow);
+    color: var(--raa-black);
+    font-weight: 600;
+  }
+
+  /* ── Main split layout ── */
+  .main-content {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+    min-height: 0;
+  }
+
+  /* ── Chat panel (left) ── */
+  .chat-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 360px;
+    transition: flex 0.3s ease;
+  }
+
+  .chat-panel.with-browser {
+    flex: 0 0 45%;
+    max-width: 540px;
+  }
+
+  .chat-container {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  /* ── Browser panel (right) ── */
+  .browser-panel {
+    display: none;
+    flex-direction: column;
+    background: var(--raa-dark);
+    border-left: 1px solid var(--raa-grey-border);
+    position: relative;
+  }
+
+  .browser-panel.visible {
+    display: flex;
+    flex: 1;
+  }
+
+  .browser-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    background: var(--raa-dark);
+    border-bottom: 1px solid #444;
+    flex-shrink: 0;
+  }
+
+  .browser-toolbar-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .browser-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+  }
+
+  .browser-dot.red { background: #FF5F57; }
+  .browser-dot.yellow { background: #FFBD2E; }
+  .browser-dot.green { background: #28CA42; }
+
+  .browser-title {
+    font-size: 12px;
+    color: #aaa;
+    font-weight: 500;
+    margin-left: 4px;
+  }
+
+  .browser-toolbar-right {
+    display: flex;
+    gap: 8px;
+  }
+
+  .browser-tb-btn {
+    background: none;
+    border: 1px solid #555;
+    color: #aaa;
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 0.15s;
+  }
+
+  .browser-tb-btn:hover {
+    border-color: var(--raa-yellow);
+    color: var(--raa-yellow);
+  }
+
+  #browserContent {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .browser-frame {
+    flex: 1;
+    border: none;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    background: #1a1a1a;
+  }
+
+  .browser-placeholder {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: #666;
+    gap: 12px;
+    padding: 24px;
+    text-align: center;
+  }
+
+  .browser-placeholder .ph-icon {
+    font-size: 48px;
+    opacity: 0.3;
+  }
+
+  .browser-placeholder .ph-text {
+    font-size: 14px;
+    line-height: 1.6;
+  }
+
+  .browser-placeholder .ph-hint {
+    font-size: 11px;
+    color: #555;
+  }
+
+  /* ── Messages ── */
+  .message {
+    display: flex;
+    gap: 10px;
+    max-width: 90%;
+    animation: fadeIn 0.3s ease;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .message.bot { align-self: flex-start; }
+  .message.user { align-self: flex-end; flex-direction: row-reverse; }
+
+  .message .avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+
+  .message.bot .avatar {
+    background: var(--raa-yellow);
+    color: var(--raa-black);
+  }
+
+  .message.user .avatar {
+    background: var(--raa-dark);
+    color: var(--raa-white);
+  }
+
+  .message .bubble {
+    padding: 10px 14px;
+    border-radius: 14px;
+    font-size: 13.5px;
+    line-height: 1.5;
+    word-wrap: break-word;
+  }
+
+  .message.bot .bubble {
+    background: var(--raa-white);
+    color: var(--raa-text);
+    border-bottom-left-radius: 4px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    border: 1px solid var(--raa-grey-border);
+  }
+
+  .message.user .bubble {
+    background: var(--raa-black);
+    color: var(--raa-white);
+    border-bottom-right-radius: 4px;
+  }
+
+  /* ── Typing ── */
+  .typing {
+    display: flex;
+    gap: 4px;
+    padding: 4px 0;
+  }
+
+  .typing span {
+    width: 7px;
+    height: 7px;
+    background: var(--raa-text-light);
+    border-radius: 50%;
+    animation: bounce 1.4s infinite ease-in-out;
+  }
+
+  .typing span:nth-child(2) { animation-delay: 0.2s; }
+  .typing span:nth-child(3) { animation-delay: 0.4s; }
+
+  @keyframes bounce {
+    0%, 80%, 100% { transform: scale(0); }
+    40% { transform: scale(1); }
+  }
+
+  /* ── Progress card ── */
+  .progress-card {
+    background: var(--raa-white);
+    border-radius: 10px;
+    padding: 14px;
+    margin: 6px 0;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    max-width: 380px;
+    border: 1px solid var(--raa-grey-border);
+    border-top: 3px solid var(--raa-yellow);
+  }
+
+  .progress-card h3 {
+    font-size: 13px;
+    color: var(--raa-text);
+    margin-bottom: 10px;
+  }
+
+  .progress-step {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 0;
+    font-size: 12px;
+    color: var(--raa-text-light);
+  }
+
+  .progress-step.active {
+    color: var(--raa-black);
+    font-weight: 600;
+  }
+
+  .progress-step.done { color: #2E7D32; }
+
+  .progress-step .icon {
+    width: 18px;
+    text-align: center;
+  }
+
+  /* ── Quick replies ── */
+  .quick-replies {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+
+  .quick-reply-btn {
+    padding: 6px 14px;
+    border: 2px solid var(--raa-yellow);
+    color: var(--raa-black);
+    background: white;
+    border-radius: 18px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .quick-reply-btn:hover {
+    background: var(--raa-yellow);
+    color: var(--raa-black);
+  }
+
+  /* ── Input area ── */
+  .input-area {
+    background: var(--raa-white);
+    padding: 12px 16px;
+    border-top: 1px solid var(--raa-grey-border);
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .input-area input[type="text"] {
+    flex: 1;
+    padding: 10px 14px;
+    border: 1px solid var(--raa-grey-border);
+    border-radius: 20px;
+    font-size: 13.5px;
+    outline: none;
+    transition: border-color 0.2s;
+    font-family: inherit;
+  }
+
+  .input-area input[type="text"]:focus {
+    border-color: var(--raa-yellow);
+    box-shadow: 0 0 0 2px rgba(255, 230, 0, 0.2);
+  }
+
+  .input-area button.send-btn {
+    width: 40px;
+    height: 40px;
+    border: none;
+    background: var(--raa-yellow);
+    color: var(--raa-black);
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.2s;
+    font-weight: 700;
+  }
+
+  .input-area button.send-btn:hover { background: var(--raa-yellow-hover); }
+  .input-area button.send-btn:disabled { background: #D9D5CC; cursor: not-allowed; }
+
+  .upload-btn {
+    width: 40px;
+    height: 40px;
+    border: 1px dashed var(--raa-text-light);
+    background: transparent;
+    color: var(--raa-text-light);
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+  }
+
+  .upload-btn:hover {
+    border-color: var(--raa-yellow);
+    color: var(--raa-black);
+    background: rgba(255, 230, 0, 0.1);
+  }
+
+  #pdfInput { display: none; }
+
+  /* ── Booking summary card ── */
+  .summary-card {
+    background: var(--raa-black);
+    color: white;
+    border-radius: 10px;
+    padding: 16px;
+    margin: 6px 0;
+    max-width: 380px;
+    border-top: 4px solid var(--raa-yellow);
+  }
+
+  .summary-card h3 {
+    font-size: 15px;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--raa-yellow);
+  }
+
+  .summary-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 5px 0;
+    font-size: 12.5px;
+    border-bottom: 1px solid rgba(255,255,255,0.1);
+  }
+
+  .summary-row:last-child { border: none; }
+  .summary-row .label { opacity: 0.7; }
+
+  .confirm-btn {
+    width: 100%;
+    margin-top: 10px;
+    padding: 10px;
+    background: var(--raa-yellow);
+    color: var(--raa-black);
+    border: none;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background 0.2s;
+    letter-spacing: 0.3px;
+  }
+
+  .confirm-btn:hover { background: var(--raa-yellow-hover); }
+
+  /* ── Footer ── */
+  .footer {
+    text-align: center;
+    padding: 6px;
+    font-size: 10px;
+    color: var(--raa-text-light);
+    background: var(--raa-white);
+    border-top: 1px solid var(--raa-grey-border);
+    flex-shrink: 0;
+  }
+
+  /* ── Responsive ── */
+  @media (max-width: 768px) {
+    .chat-panel.with-browser {
+      flex: 0 0 100%;
+      max-width: 100%;
+    }
+    .browser-panel.visible {
+      position: absolute;
+      top: 56px;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 20;
+    }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-logo">
+    <div class="logo-arrow"></div>
+    <span class="logo-text">RAA</span>
+  </div>
+  <div class="header-divider"></div>
+  <h1>Travel Booking Assistant</h1>
+  <div class="header-right">
+    <div class="status disconnected" id="statusBadge">Disconnected</div>
+    <button class="browser-toggle" id="browserToggle" onclick="toggleBrowser()" style="display:none;">
+      <span id="browserToggleIcon">&#9655;</span>
+      <span id="browserToggleText">Show Browser</span>
+    </button>
+  </div>
+</div>
+
+<div class="main-content">
+  <!-- Left: Chat -->
+  <div class="chat-panel" id="chatPanel">
+    <div class="chat-container" id="chatContainer"></div>
+    <div class="input-area">
+      <input type="file" id="pdfInput" accept=".pdf">
+      <button class="upload-btn" onclick="document.getElementById('pdfInput').click()" title="Upload PDF">&#128206;</button>
+      <input type="text" id="userInput" placeholder="Tell me where you'd like to fly..."
+             onkeydown="if(event.key==='Enter' && !event.shiftKey) sendMessage()">
+      <button class="send-btn" id="sendBtn" onclick="sendMessage()">&#10148;</button>
+    </div>
+  </div>
+
+  <!-- Right: Browser viewer -->
+  <div class="browser-panel" id="browserPanel">
+    <div class="browser-toolbar">
+      <div class="browser-toolbar-left">
+        <div class="browser-dot red"></div>
+        <div class="browser-dot yellow"></div>
+        <div class="browser-dot green"></div>
+        <span class="browser-title">Live Browser View</span>
+      </div>
+      <div class="browser-toolbar-right">
+        <button class="browser-tb-btn" onclick="refreshBrowser()" title="Reload viewer">&#8635; Reload</button>
+        <button class="browser-tb-btn" onclick="popOutBrowser()" title="Open in new tab">&#8599; Pop Out</button>
+      </div>
+    </div>
+    <div id="browserContent">
+      <div class="browser-placeholder" id="browserPlaceholder">
+        <div class="ph-icon">&#127760;</div>
+        <div class="ph-text">Browser will appear here when<br>automation starts</div>
+        <div class="ph-hint">The viewer connects to noVNC on port 6080</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  RAA Travel &mdash; Powered by AI &bull; Keeping South Australia moving since 1903
+</div>
+
+<script>
+  const chatContainer = document.getElementById('chatContainer');
+  const userInput = document.getElementById('userInput');
+  const sendBtn = document.getElementById('sendBtn');
+  const statusBadge = document.getElementById('statusBadge');
+  const pdfInput = document.getElementById('pdfInput');
+  const chatPanel = document.getElementById('chatPanel');
+  const browserPanel = document.getElementById('browserPanel');
+  const browserContent = document.getElementById('browserContent');
+  const browserPlaceholder = document.getElementById('browserPlaceholder');
+  const browserToggle = document.getElementById('browserToggle');
+
+  let ws = null;
+  let isProcessing = false;
+  let browserVisible = false;
+  let browserLoaded = false;
+
+  // ── Browser panel controls ──
+  function toggleBrowser() {
+    browserVisible = !browserVisible;
+    browserPanel.classList.toggle('visible', browserVisible);
+    chatPanel.classList.toggle('with-browser', browserVisible);
+    browserToggle.classList.toggle('active', browserVisible);
+
+    document.getElementById('browserToggleIcon').innerHTML = browserVisible ? '&#9654;' : '&#9655;';
+    document.getElementById('browserToggleText').textContent = browserVisible ? 'Hide Browser' : 'Show Browser';
+
+    if (browserVisible && !browserLoaded) {
+      loadBrowserViewer();
+    }
+
+    // Scroll chat to bottom after layout shift
+    setTimeout(() => scrollToBottom(), 100);
+  }
+
+  function loadBrowserViewer() {
+    // Build the noVNC URL — same host, port 6080
+    // vnc.html with resize=scale auto-fits the canvas to the iframe
+    const vncHost = location.hostname;
+    const vncPort = 6080;
+    const vncUrl = `http://${vncHost}:${vncPort}/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=3000&show_dot=true&bell=false&view_only=false`;
+
+    browserPlaceholder.remove();
+
+    const iframe = document.createElement('iframe');
+    iframe.id = 'browserFrame';
+    iframe.className = 'browser-frame';
+    iframe.src = vncUrl;
+    iframe.allow = 'clipboard-read; clipboard-write';
+    browserContent.appendChild(iframe);
+
+    browserLoaded = true;
+  }
+
+  function refreshBrowser() {
+    const iframe = document.getElementById('browserFrame');
+    if (iframe) {
+      iframe.src = iframe.src;
+    } else {
+      browserLoaded = false;
+      loadBrowserViewer();
+    }
+  }
+
+  function popOutBrowser() {
+    const vncHost = location.hostname;
+    const vncPort = 6080;
+    window.open(
+      `http://${vncHost}:${vncPort}/vnc.html?autoconnect=true&resize=scale&scaleViewport=true`,
+      'raa-browser',
+      'width=1024,height=768'
+    );
+  }
+
+  // ── Auto-show browser when automation starts ──
+  function showBrowserIfHidden() {
+    if (!browserVisible) {
+      toggleBrowser();
+    }
+  }
+
+  // ── WebSocket ──
+  function connect() {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${protocol}//${location.host}/ws`);
+
+    ws.onopen = () => {
+      statusBadge.textContent = 'Connected';
+      statusBadge.className = 'status connected';
+    };
+
+    ws.onclose = () => {
+      statusBadge.textContent = 'Disconnected';
+      statusBadge.className = 'status disconnected';
+      setTimeout(connect, 3000);
+    };
+
+    ws.onerror = () => {
+      statusBadge.textContent = 'Error';
+      statusBadge.className = 'status disconnected';
+    };
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      handleServerMessage(data);
+    };
+  }
+
+  function handleServerMessage(data) {
+    removeTypingIndicator();
+
+    switch (data.type) {
+      case 'bot_message':
+        addBotMessage(data.text, data.quickReplies);
+        break;
+      case 'progress':
+        updateProgress(data.steps, data.currentStep);
+        break;
+      case 'summary':
+        showBookingSummary(data.booking);
+        break;
+      case 'itinerary':
+        showItinerary(data.itinerary, data.savedPath);
+        break;
+      case 'tramada_prompt':
+        showTramadaPrompt();
+        break;
+      case 'tramada_progress':
+        updateTramadaProgress(data.percent, data.message);
+        break;
+      case 'tramada_add_complete':
+        showTramadaAddResult(data.data);
+        break;
+      case 'tramada_results':
+        showTramadaSearchResults(data.data);
+        break;
+      case 'tramada_complete':
+        addBotMessage('&#9989; Tramada done.');
+        break;
+      case 'automation_update':
+        addBotMessage(`&#9881; ${data.text}`);
+        break;
+      case 'automation_complete':
+        addBotMessage(`&#9989; ${data.text}`);
+        break;
+      case 'error':
+        addBotMessage(`&#10060; ${data.text}`);
+        break;
+      case 'typing':
+        showTypingIndicator();
+        break;
+    }
+
+    isProcessing = false;
+    sendBtn.disabled = false;
+  }
+
+  function sendMessage() {
+    const text = userInput.value.trim();
+    if (!text || isProcessing || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+    addUserMessage(text);
+    ws.send(JSON.stringify({ type: 'user_message', text }));
+
+    userInput.value = '';
+    isProcessing = true;
+    sendBtn.disabled = true;
+    showTypingIndicator();
+  }
+
+  function sendQuickReply(text) {
+    userInput.value = text;
+    sendMessage();
+  }
+
+  pdfInput.addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64 = reader.result.split(',')[1];
+      addUserMessage(`&#128196; Uploaded: ${file.name}`);
+      ws.send(JSON.stringify({ type: 'pdf_upload', filename: file.name, data: base64 }));
+      showTypingIndicator();
+    };
+    reader.readAsDataURL(file);
+    pdfInput.value = '';
+  });
+
+  function addBotMessage(text, quickReplies) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message bot';
+    wrapper.innerHTML = `
+      <div class="avatar">R</div>
+      <div>
+        <div class="bubble">${text}</div>
+        ${quickReplies ? `<div class="quick-replies">${quickReplies.map(r =>
+          `<button class="quick-reply-btn" onclick="sendQuickReply('${r}')">${r}</button>`
+        ).join('')}</div>` : ''}
+      </div>
+    `;
+    chatContainer.appendChild(wrapper);
+    scrollToBottom();
+  }
+
+  function addUserMessage(text) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message user';
+    wrapper.innerHTML = `
+      <div class="avatar">&#128100;</div>
+      <div class="bubble">${text}</div>
+    `;
+    chatContainer.appendChild(wrapper);
+    scrollToBottom();
+  }
+
+  function showTypingIndicator() {
+    removeTypingIndicator();
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message bot';
+    wrapper.id = 'typingIndicator';
+    wrapper.innerHTML = `
+      <div class="avatar">R</div>
+      <div class="bubble"><div class="typing"><span></span><span></span><span></span></div></div>
+    `;
+    chatContainer.appendChild(wrapper);
+    scrollToBottom();
+  }
+
+  function removeTypingIndicator() {
+    const el = document.getElementById('typingIndicator');
+    if (el) el.remove();
+  }
+
+  function showBookingSummary(booking) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message bot';
+    wrapper.innerHTML = `
+      <div class="avatar">R</div>
+      <div>
+        <div class="summary-card">
+          <h3>&#9992; Booking Summary</h3>
+          <div class="summary-row"><span class="label">From</span><span>${booking.origin || '—'}</span></div>
+          <div class="summary-row"><span class="label">To</span><span>${booking.destination || '—'}</span></div>
+          <div class="summary-row"><span class="label">Departure</span><span>${booking.departureDate || '—'}</span></div>
+          <div class="summary-row"><span class="label">Return</span><span>${booking.returnDate || '—'}</span></div>
+          <div class="summary-row"><span class="label">Adults</span><span>${booking.adults || 0}</span></div>
+          <div class="summary-row"><span class="label">Children</span><span>${booking.children || 0}${booking.childAges ? ' (ages: ' + booking.childAges.join(', ') + ')' : ''}</span></div>
+          <div class="summary-row"><span class="label">Budget</span><span>${booking.budget || '—'}</span></div>
+          <div class="summary-row"><span class="label">Checked Bags</span><span>${booking.checkedBags || 'No'}</span></div>
+          <div class="summary-row"><span class="label">Carry-on</span><span>${booking.carryOn || '7kg'}</span></div>
+          <div class="summary-row"><span class="label">Seat Pref</span><span>${booking.seatPreference || 'No preference'}</span></div>
+          <div class="summary-row"><span class="label">Insurance</span><span>${booking.insurance || 'No'}</span></div>
+          <button class="confirm-btn" onclick="sendQuickReply('Yes, book it!')">&#10004; Confirm & Start Booking</button>
+        </div>
+      </div>
+    `;
+    chatContainer.appendChild(wrapper);
+    scrollToBottom();
+  }
+
+  function showItinerary(itinerary, savedPath) {
+    const b = (itinerary && itinerary.booking) || {};
+    const d = (itinerary && itinerary.detected) || {};
+    const p = (itinerary && itinerary.page) || {};
+
+    const route = `${b.originCode || b.origin || '—'} → ${b.destinationCode || b.destination || '—'}`;
+    const dates = b.tripType === 'return' && b.returnDate
+      ? `${b.departureDate || '—'} → ${b.returnDate}`
+      : (b.departureDate || '—');
+    const childrenLine = (b.children || 0) > 0 && b.childAges && b.childAges.length
+      ? `${b.children} (ages: ${b.childAges.join(', ')})`
+      : String(b.children || 0);
+    const flightsDetected = (d.flightNumbers && d.flightNumbers.length)
+      ? d.flightNumbers.join(', ')
+      : '—';
+    const totalDetected = d.total || '—';
+    const captured = itinerary && itinerary.capturedAt
+      ? new Date(itinerary.capturedAt).toLocaleString()
+      : '—';
+    const savedFilename = savedPath ? savedPath.split('/').pop() : '—';
+    const escapeAttr = (s) => String(s || '').replace(/"/g, '&quot;');
+    const sourceUrl = p.url || '';
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message bot';
+    wrapper.innerHTML = `
+      <div class="avatar">R</div>
+      <div>
+        <div class="summary-card">
+          <h3>&#128221; Itinerary</h3>
+          <div class="summary-row"><span class="label">Route</span><span>${route}</span></div>
+          <div class="summary-row"><span class="label">Trip Type</span><span>${b.tripType || '—'}</span></div>
+          <div class="summary-row"><span class="label">Dates</span><span>${dates}</span></div>
+          <div class="summary-row"><span class="label">Adults</span><span>${b.adults || 0}</span></div>
+          <div class="summary-row"><span class="label">Children</span><span>${childrenLine}</span></div>
+          <div class="summary-row"><span class="label">Infants</span><span>${b.infants || 0}</span></div>
+          <div class="summary-row"><span class="label">Budget</span><span>${b.budget != null && b.budget !== '' ? b.budget : '—'}</span></div>
+          <div class="summary-row"><span class="label">Flight #s</span><span>${flightsDetected}</span></div>
+          <div class="summary-row"><span class="label">Total (page)</span><span>${totalDetected}</span></div>
+          <div class="summary-row"><span class="label">Captured</span><span>${captured}</span></div>
+          <div class="summary-row"><span class="label">Saved as</span><span>${savedFilename}</span></div>
+          ${sourceUrl ? `<div class="summary-row"><span class="label">Source</span><span><a href="${escapeAttr(sourceUrl)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">open page</a></span></div>` : ''}
+        </div>
+      </div>
+    `;
+    chatContainer.appendChild(wrapper);
+    scrollToBottom();
+  }
+
+  function showTramadaPrompt() {
+    if (document.getElementById('tramadaPrompt')) return;  // don't double-render
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message bot';
+    wrapper.id = 'tramadaPrompt';
+    wrapper.innerHTML = `
+      <div class="avatar">R</div>
+      <div>
+        <div class="summary-card">
+          <h3>&#128274; Add to Tramada</h3>
+          <div class="summary-row"><span class="label">Username</span><span><input id="tramUser" type="text" autocomplete="username" style="background:transparent;border:1px solid #555;color:inherit;padding:4px 6px;border-radius:4px;width:100%;max-width:200px;text-align:right;"></span></div>
+          <div class="summary-row"><span class="label">Password</span><span><input id="tramPass" type="password" autocomplete="current-password" style="background:transparent;border:1px solid #555;color:inherit;padding:4px 6px;border-radius:4px;width:100%;max-width:200px;text-align:right;"></span></div>
+          <div class="summary-row"><span class="label">Client Code</span><span><input id="tramClient" type="text" placeholder="e.g. GRAY/SPIDER" style="background:transparent;border:1px solid #555;color:inherit;padding:4px 6px;border-radius:4px;width:100%;max-width:200px;text-align:right;"></span></div>
+          <button class="confirm-btn" onclick="submitTramadaChain()">&#128190; Add &amp; Search</button>
+        </div>
+      </div>
+    `;
+    chatContainer.appendChild(wrapper);
+    scrollToBottom();
+  }
+
+  window.submitTramadaChain = function () {
+    const username = (document.getElementById('tramUser') || {}).value || '';
+    const password = (document.getElementById('tramPass') || {}).value || '';
+    const clientCode = (document.getElementById('tramClient') || {}).value || '';
+    if (!username || !password || !clientCode) {
+      addBotMessage('&#10060; Please fill in all three fields.');
+      return;
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      addBotMessage('&#10060; Not connected to server.');
+      return;
+    }
+    ws.send(JSON.stringify({ type: 'tramada_chain', username, password, clientCode }));
+    // Disable the form so the user can't double-submit.
+    const card = document.getElementById('tramadaPrompt');
+    if (card) {
+      card.querySelectorAll('input, button').forEach((el) => (el.disabled = true));
+    }
+    addBotMessage('&#9881; Submitting Tramada chain...');
+  };
+
+  function updateTramadaProgress(percent, message) {
+    let card = document.getElementById('tramadaProgressCard');
+    if (!card) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'message bot';
+      wrapper.id = 'tramadaProgressCard';
+      wrapper.innerHTML = `
+        <div class="avatar">R</div>
+        <div>
+          <div class="summary-card">
+            <h3>&#9881; Tramada</h3>
+            <div class="summary-row"><span class="label">Status</span><span id="tramStatus">starting…</span></div>
+            <div class="summary-row"><span class="label">Progress</span><span id="tramPct">0%</span></div>
+          </div>
+        </div>
+      `;
+      chatContainer.appendChild(wrapper);
+      card = wrapper;
+    }
+    const status = card.querySelector('#tramStatus');
+    const pct = card.querySelector('#tramPct');
+    if (status) status.textContent = message || '';
+    if (pct) pct.textContent = (percent != null ? percent : 0) + '%';
+    scrollToBottom();
+  }
+
+  function showTramadaAddResult(addResult) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message bot';
+    const summary = addResult && addResult.summary;
+    let body;
+    if (summary) {
+      body = `
+        <div class="summary-row"><span class="label">Bkg No</span><span>${summary.bkgNo || '—'}</span></div>
+        <div class="summary-row"><span class="label">Client</span><span>${summary.client || '—'}</span></div>
+        <div class="summary-row"><span class="label">Debtor</span><span>${summary.debtor || '—'}</span></div>
+        <div class="summary-row"><span class="label">Itinerary</span><span style="text-align:right;max-width:60%;word-break:break-word;">${summary.itinerary || '—'}</span></div>
+        <div class="summary-row"><span class="label">Departure</span><span>${summary.depDate || '—'}</span></div>
+        <div class="summary-row"><span class="label">Return</span><span>${summary.retDate || '—'}</span></div>
+        <div class="summary-row"><span class="label">Final Tkt</span><span>${summary.finalTkt || '—'}</span></div>
+      `;
+    } else {
+      body = `
+        <div class="summary-row"><span class="label">Booking No</span><span>${addResult && addResult.bookingNo ? addResult.bookingNo : 'unknown'}</span></div>
+        <div class="summary-row"><span class="label">URL</span><span style="word-break:break-all;font-size:11px;">${addResult && addResult.url ? addResult.url : '—'}</span></div>
+        <div class="summary-row"><span class="label" style="opacity:0.6;">Note</span><span style="opacity:0.6;font-size:11px;">Search row not matched yet.</span></div>
+      `;
+    }
+    wrapper.innerHTML = `
+      <div class="avatar">R</div>
+      <div>
+        <div class="summary-card">
+          <h3>&#10004; Tramada Booking Added</h3>
+          ${body}
+        </div>
+      </div>
+    `;
+    chatContainer.appendChild(wrapper);
+    scrollToBottom();
+  }
+
+  function showTramadaSearchResults(rows) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message bot';
+    const tableRows = (rows && rows.length)
+      ? rows.slice(0, 20).map((r) => `
+          <tr>
+            <td style="padding:4px 8px;border-bottom:1px solid #333;">${r.bkgNo || ''}</td>
+            <td style="padding:4px 8px;border-bottom:1px solid #333;">${r.client || ''}</td>
+            <td style="padding:4px 8px;border-bottom:1px solid #333;">${r.depDate || ''}</td>
+            <td style="padding:4px 8px;border-bottom:1px solid #333;">${r.retDate || ''}</td>
+          </tr>
+        `).join('')
+      : '<tr><td style="padding:4px 8px;opacity:0.7;" colspan="4">No bookings found.</td></tr>';
+    wrapper.innerHTML = `
+      <div class="avatar">R</div>
+      <div>
+        <div class="summary-card">
+          <h3>&#128203; Tramada — Booked (${(rows && rows.length) || 0})</h3>
+          <table style="width:100%;font-size:12px;border-collapse:collapse;">
+            <thead><tr>
+              <th style="text-align:left;padding:4px 8px;opacity:0.7;">Bkg No</th>
+              <th style="text-align:left;padding:4px 8px;opacity:0.7;">Client</th>
+              <th style="text-align:left;padding:4px 8px;opacity:0.7;">Dep</th>
+              <th style="text-align:left;padding:4px 8px;opacity:0.7;">Ret</th>
+            </tr></thead>
+            <tbody>${tableRows}</tbody>
+          </table>
+        </div>
+      </div>
+    `;
+    chatContainer.appendChild(wrapper);
+    scrollToBottom();
+  }
+
+  function updateProgress(steps, currentStep) {
+    const old = document.getElementById('progressCard');
+    if (old) old.remove();
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message bot';
+    wrapper.id = 'progressCard';
+    wrapper.innerHTML = `
+      <div class="avatar">R</div>
+      <div class="progress-card">
+        <h3>&#9881; Automation Progress</h3>
+        ${steps.map((step, i) => {
+          let cls = i < currentStep ? 'done' : i === currentStep ? 'active' : '';
+          let icon = i < currentStep ? '&#10004;' : i === currentStep ? '&#9654;' : '&#9675;';
+          return `<div class="progress-step ${cls}"><span class="icon">${icon}</span>${step}</div>`;
+        }).join('')}
+      </div>
+    `;
+    chatContainer.appendChild(wrapper);
+    scrollToBottom();
+  }
+
+  function scrollToBottom() {
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+  }
+
+  connect();
+</script>
+</body>
+</html>

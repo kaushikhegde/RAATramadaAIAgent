@@ -1,0 +1,21 @@
+# ─── Dependencies ───────────────────────────────────────────
+node_modules/
+
+# ─── Secrets & environment ──────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ─── Chrome CDP profile (cookies / session data) ────────────
+.jetstar-profile-cdp/
+
+# ─── Runtime artifacts (may contain booking PII) ────────────
+Completed/*
+!Completed/.gitkeep
+Todo/*
+!Todo/.gitkeep
+
+# ─── OS / editor ────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+.idea/
