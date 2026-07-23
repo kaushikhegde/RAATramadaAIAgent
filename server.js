@@ -24,11 +24,16 @@ const { runJetstarBooking } = require("./booking");
 const { buildSystemPrompt } = require("./geminiPrompt");
 const { runTramadaAutomation } = require("./tramada-automator");
 const { runTramadaAddAndSearch } = require("./tramada-booking");
+const { runTramadaReceipt, searchBookingsForReceipt } = require("./tramada-receipt");
+const { runFullBooking } = require("./tramada-segments");
 
 // ─── Config ──────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const DEBUG = process.env.DEBUG === "true";
+// Skip the Jetstar browser automation and go straight from chat → Tramada.
+// Tramada only needs chat-collected fields, so nothing from Jetstar is required.
+const SKIP_JETSTAR = process.env.SKIP_JETSTAR === "true";
 
 function log(...args) {
   if (DEBUG) console.log("[server]", ...args);
@@ -91,7 +96,9 @@ wss.on("connection", (ws) => {
   // Send welcome message
   sendToClient(ws, {
     type: "bot_message",
-    text: "G'day! ✈️ I'm your Jetstar booking assistant. I can help you find and book flights on Jetstar. Just tell me where you'd like to go, or upload a booking PDF if you have one ready!",
+    text: SKIP_JETSTAR
+      ? "G'day! ✈️ I'm your travel booking assistant. Tell me the trip details and I'll record the booking in Tramada — or upload a booking PDF if you have one ready!"
+      : "G'day! ✈️ I'm your Jetstar booking assistant. I can help you find and book flights on Jetstar. Just tell me where you'd like to go, or upload a booking PDF if you have one ready!",
     quickReplies: ["Book a flight", "Upload PDF"],
   });
 });
@@ -117,7 +124,7 @@ function getGeminiChat() {
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
   const model = genAI.getGenerativeModel({
     model: "gemini-2.5-flash",
-    systemInstruction: buildSystemPrompt(),
+    systemInstruction: buildSystemPrompt({ skipJetstar: SKIP_JETSTAR }),
   });
 
   return model.startChat({
@@ -151,6 +158,26 @@ async function handleClientMessage(session, msg) {
       await handleTramadaChain(session, msg.username, msg.password, msg.clientCode);
       break;
 
+    // ── Receipt flow ──────────────────────────────────────────────
+    // req 5: no booking number → search & return a list to pick from.
+    case "receipt_search":
+      await handleReceiptSearch(session, msg);
+      break;
+
+    // Preview (fill, don't commit) then commit. The chat confirms BEFORE
+    // committing: send { confirmed: false } (or omit) for a preview, then
+    // { confirmed: true } to actually issue.
+    case "receipt_run":
+      await handleReceiptRun(session, msg);
+      break;
+
+    // Full pipeline: booking → segments → costing → receipt. Same confirm gate
+    // as receipt_run: omit `confirmed` to preview the receipt, send it true to
+    // commit. Booking + segments + costing are created either way.
+    case "pipeline_run":
+      await handlePipelineRun(session, msg);
+      break;
+
     default:
       log("Unknown message type:", msg.type);
   }
@@ -168,6 +195,17 @@ async function handleUserMessage(session, userText) {
     session.bookingData &&
     /yes.*book|confirm|let'?s? go|book it|proceed|start booking/i.test(userText)
   ) {
+    if (SKIP_JETSTAR) {
+      sendToClient(ws, {
+        type: "bot_message",
+        text: "Beauty! Let's get this straight into Tramada.",
+      });
+      sendToClient(ws, {
+        type: "tramada_prompt",
+        clientCode: session.bookingData.clientCode || "",
+      });
+      return;
+    }
     sendToClient(ws, {
       type: "bot_message",
       text: "Awesome! Starting the booking automation now. I'll keep you updated on each step...",
@@ -260,6 +298,8 @@ function parseGeminiResponse(response) {
           passengers: Array.isArray(data.passengers) ? data.passengers : [],
           contactEmail: (data.contact && data.contact.email) || "",
           contactPhone: (data.contact && data.contact.phone) || "",
+          // Tramada client the booking is filed against (e.g. "GRAY/SPIDER").
+          clientCode: (data.clientCode || "").trim(),
           budget: data.budget || "",
           timePreference: data.timePreference || "any",
           checkedBags: data.checkedBags || "no",
@@ -421,7 +461,10 @@ async function startAutomation(session) {
           session.lastItineraryPath = savedPath;
           sendToClient(session.ws, { type: "itinerary", itinerary, savedPath });
           // Prompt the user for Tramada credentials right after the itinerary card.
-          sendToClient(session.ws, { type: "tramada_prompt" });
+          sendToClient(session.ws, {
+            type: "tramada_prompt",
+            clientCode: (session.bookingData && session.bookingData.clientCode) || "",
+          });
         },
         onComplete: (message) => {
           if (!session.active) return;
@@ -449,7 +492,12 @@ async function startAutomation(session) {
 async function handleTramadaChain(session, username, password, clientCode) {
   const { ws } = session;
 
-  if (!username || !password || !clientCode) {
+  // Fall back to the client the user gave Gemini during the chat.
+  const client =
+    (clientCode || "").trim() ||
+    ((session.bookingData && session.bookingData.clientCode) || "").trim();
+
+  if (!username || !password || !client) {
     sendToClient(ws, {
       type: "error",
       text: "Tramada username, password, and client code are all required.",
@@ -461,7 +509,9 @@ async function handleTramadaChain(session, username, password, clientCode) {
   if (!booking || !booking.departureDate) {
     sendToClient(ws, {
       type: "error",
-      text: "No Jetstar itinerary in session yet — run the booking first.",
+      text: SKIP_JETSTAR
+        ? "No booking details in session yet — tell me your trip details first."
+        : "No Jetstar itinerary in session yet — run the booking first.",
     });
     return;
   }
@@ -472,7 +522,7 @@ async function handleTramadaChain(session, username, password, clientCode) {
     const result = await runTramadaAddAndSearch({
       username,
       password,
-      clientCode,
+      clientCode: client,
       booking,
       callbacks: {
         onProgress: (pct, msg) => {
@@ -533,6 +583,166 @@ async function handleTramadaSearch(session, username, password) {
     sendToClient(ws, { type: "tramada_results", data: result });
   } catch (err) {
     sendToClient(ws, { type: "error", text: `Tramada search failed: ${err.message}` });
+  }
+}
+
+// ─── Receipt: search bookings (req 5 — no booking number given) ──
+async function handleReceiptSearch(session, msg) {
+  const { ws } = session;
+  try {
+    sendToClient(ws, { type: "bot_message", text: "Searching bookings..." });
+    const bookings = await searchBookingsForReceipt({
+      username: msg.username,
+      password: msg.password,
+      status: msg.status,          // optional: NEW|QUOTE|BOOKED|FINALISED|CANCELLED
+      clientName: msg.clientName,  // optional filter
+      bookingNo: msg.bookingNo,    // optional filter
+    });
+    sendToClient(ws, { type: "receipt_booking_list", bookings });
+    if (!bookings.length) {
+      sendToClient(ws, {
+        type: "bot_message",
+        text: "No bookings matched. Try a client name or a different status.",
+      });
+    }
+  } catch (err) {
+    sendToClient(ws, { type: "error", text: `Booking search failed: ${err.message}` });
+  }
+}
+
+// ─── Receipt: preview then commit (confirm-before-commit gate) ───
+async function handleReceiptRun(session, msg) {
+  const { ws } = session;
+
+  const bookingNo = msg.bookingNo;
+  const receipt = msg.receipt || {};
+  const confirmed = msg.confirmed === true;
+
+  if (!bookingNo) {
+    sendToClient(ws, { type: "error", text: "Booking number is required to raise a receipt." });
+    return;
+  }
+  if (!receipt.reference) {
+    sendToClient(ws, { type: "error", text: "Receipt reference is required." });
+    return;
+  }
+
+  const callbacks = {
+    onProgress: (pct, m) => {
+      if (session.active) sendToClient(ws, { type: "receipt_progress", percent: pct, message: m });
+    },
+    onError: (m) => {
+      if (session.active) sendToClient(ws, { type: "error", text: `Receipt error: ${m}` });
+    },
+  };
+
+  try {
+    const result = await runTramadaReceipt({
+      username: msg.username,
+      password: msg.password,
+      bookingNo,
+      receipt,
+      dryRun: !confirmed, // preview unless explicitly confirmed
+      callbacks,
+    });
+
+    if (!confirmed) {
+      // Show the staged receipt + booking details and ask the user to confirm.
+      sendToClient(ws, {
+        type: "receipt_preview",
+        details: result.details,
+        staged: result.staged,
+        segments: result.segments,
+        previewImage: result.previewImage || null,
+      });
+      sendToClient(ws, {
+        type: "bot_message",
+        text:
+          `Ready to issue this receipt on booking ${bookingNo}: ` +
+          `${result.staged.amount} (ref ${result.staged.reference}). ` +
+          `Confirm to commit — nothing has been saved yet.`,
+        quickReplies: ["Yes, issue it", "Cancel"],
+      });
+      return;
+    }
+
+    // Committed.
+    sendToClient(ws, { type: "receipt_complete", receipt: result.receipt, details: result.details });
+    sendToClient(ws, {
+      type: "bot_message",
+      text: result.receipt
+        ? `Done ✅ Receipt ${result.receipt.receiptNo} issued for ${result.receipt.amount} ` +
+          `(ref ${result.receipt.reference}), allocated ${result.receipt.allocated}.`
+        : "Receipt issued.",
+    });
+  } catch (err) {
+    sendToClient(ws, { type: "error", text: `Receipt failed: ${err.message}` });
+  }
+}
+
+// ─── Full pipeline: booking → segments → costing → receipt ───────
+async function handlePipelineRun(session, msg) {
+  const { ws } = session;
+  const confirmed = msg.confirmed === true;
+
+  if (!msg.clientCode || !msg.booking) {
+    sendToClient(ws, { type: "error", text: "clientCode and booking are required to run the pipeline." });
+    return;
+  }
+  if (!msg.receipt || !msg.receipt.reference) {
+    sendToClient(ws, { type: "error", text: "receipt.reference is required." });
+    return;
+  }
+
+  try {
+    const result = await runFullBooking({
+      username: msg.username,
+      password: msg.password,
+      clientCode: msg.clientCode,
+      booking: msg.booking,
+      segments: msg.segments || [],
+      costings: msg.costings || [],
+      receipt: msg.receipt,
+      dryRunReceipt: !confirmed, // preview the receipt unless confirmed
+      callbacks: {
+        onProgress: (pct, m) => {
+          if (session.active) sendToClient(ws, { type: "pipeline_progress", percent: pct, message: m });
+        },
+        onError: (m) => {
+          if (session.active) sendToClient(ws, { type: "error", text: `Pipeline error: ${m}` });
+        },
+        onStage: (name, data) => {
+          if (session.active) sendToClient(ws, { type: "pipeline_stage", stage: name, data });
+        },
+      },
+    });
+
+    if (!confirmed) {
+      sendToClient(ws, {
+        type: "pipeline_preview",
+        bookingNo: result.bookingNo,
+        staged: result.receipt && result.receipt.staged,
+        previewImage: result.receipt && result.receipt.previewImage,
+      });
+      sendToClient(ws, {
+        type: "bot_message",
+        text:
+          `Booking ${result.bookingNo} created with its segments and costing. ` +
+          `Receipt is staged (${msg.receipt.amount}, ref ${msg.receipt.reference}) but NOT committed. Confirm to issue it.`,
+        quickReplies: ["Yes, issue it", "Cancel"],
+      });
+      return;
+    }
+
+    sendToClient(ws, { type: "pipeline_complete", result });
+    sendToClient(ws, {
+      type: "bot_message",
+      text: result.receipt && result.receipt.receipt
+        ? `Done ✅ Booking ${result.bookingNo}, receipt ${result.receipt.receipt.receiptNo} issued.`
+        : `Done ✅ Booking ${result.bookingNo} — pipeline complete.`,
+    });
+  } catch (err) {
+    sendToClient(ws, { type: "error", text: `Pipeline failed: ${err.message}` });
   }
 }
 

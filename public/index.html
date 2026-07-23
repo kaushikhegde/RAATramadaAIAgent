@@ -754,7 +754,7 @@
         showItinerary(data.itinerary, data.savedPath);
         break;
       case 'tramada_prompt':
-        showTramadaPrompt();
+        showTramadaPrompt(data.clientCode || '');
         break;
       case 'tramada_progress':
         updateTramadaProgress(data.percent, data.message);
@@ -939,8 +939,9 @@
     scrollToBottom();
   }
 
-  function showTramadaPrompt() {
+  function showTramadaPrompt(clientCode) {
     if (document.getElementById('tramadaPrompt')) return;  // don't double-render
+    const attr = (s) => String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
     const wrapper = document.createElement('div');
     wrapper.className = 'message bot';
     wrapper.id = 'tramadaPrompt';
@@ -951,7 +952,7 @@
           <h3>&#128274; Add to Tramada</h3>
           <div class="summary-row"><span class="label">Username</span><span><input id="tramUser" type="text" autocomplete="username" style="background:transparent;border:1px solid #555;color:inherit;padding:4px 6px;border-radius:4px;width:100%;max-width:200px;text-align:right;"></span></div>
           <div class="summary-row"><span class="label">Password</span><span><input id="tramPass" type="password" autocomplete="current-password" style="background:transparent;border:1px solid #555;color:inherit;padding:4px 6px;border-radius:4px;width:100%;max-width:200px;text-align:right;"></span></div>
-          <div class="summary-row"><span class="label">Client Code</span><span><input id="tramClient" type="text" placeholder="e.g. GRAY/SPIDER" style="background:transparent;border:1px solid #555;color:inherit;padding:4px 6px;border-radius:4px;width:100%;max-width:200px;text-align:right;"></span></div>
+          <div class="summary-row"><span class="label">Client Code</span><span><input id="tramClient" type="text" placeholder="e.g. GRAY/SPIDER" value="${attr(clientCode)}" style="background:transparent;border:1px solid #555;color:inherit;padding:4px 6px;border-radius:4px;width:100%;max-width:200px;text-align:right;"></span></div>
           <button class="confirm-btn" onclick="submitTramadaChain()">&#128190; Add &amp; Search</button>
         </div>
       </div>

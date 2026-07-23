@@ -16,6 +16,13 @@ const TRAMADA_BASE_URL =
 const CDP_PORT = parseInt(process.env.CDP_PORT || "9222", 10);
 const CDP_HOST = process.env.CDP_HOST || "127.0.0.1";
 
+// "internal" launches real Chrome directly (no remote-debugging port needed).
+// "external" attaches to a Chrome already started with --remote-debugging-port,
+// falling back to launching Chrome if that port isn't listening.
+const CDP_MODE = process.env.CDP_MODE || "external";
+const BROWSER_CHANNEL = process.env.BROWSER_CHANNEL || "chrome";
+const HEADLESS = process.env.HEADLESS === "true";
+
 // Australian airport codes — used to auto-detect DOM vs INT.
 // Mirrors the Aussie list in geminiPrompt.js / parsePdf.js.
 const AU_AIRPORT_CODES = new Set([
@@ -82,12 +89,58 @@ function mapJetstarToTramada(booking, clientCode) {
     bankAccount: "1",                             // [TRUST] Trust Account
     bookingType: "LEISURE",
     bookingSource: "EML",
-    destination: isDomestic ? "DOM" : "INT",
+    // destinationTypeCode has NO "INT" option. Valid values are region codes
+    // (DOM, ASIA, EUROPE, USA_CANADA, NZ, ...) or OTHER. Domestic => DOM;
+    // international => the caller-supplied region, else OTHER (a safe default).
+    destination: isDomestic ? "DOM" : (booking.destinationRegion || "OTHER"),
     domInt: isDomestic ? "DOMESTIC" : "INTERNATIONAL",
     cabinClass: "ECON",
     itinerary: itinerarySummary,
     primaryDest: dest,
   };
+}
+
+/**
+ * Get a browser to drive Tramada with.
+ *
+ * Tramada has no bot detection to defeat, so a plainly-launched Chrome works —
+ * unlike the Jetstar flow, which needs the warm CDP profile to get past Akamai.
+ *
+ * @returns {Promise<{browser: import('playwright').Browser, launched: boolean}>}
+ *   `launched` is true when we started Chrome ourselves (so we own closing it).
+ */
+async function openBrowser(onProgress) {
+  const launchChrome = async () => {
+    const browser = await chromium.launch({
+      channel: BROWSER_CHANNEL,
+      headless: HEADLESS,
+      args: ["--no-first-run", "--no-default-browser-check"],
+    });
+    return { browser, launched: true };
+  };
+
+  if (CDP_MODE === "internal") {
+    onProgress(5, `Launching Chrome (${BROWSER_CHANNEL})...`);
+    return await launchChrome();
+  }
+
+  onProgress(5, `Connecting to CDP Chrome at ${CDP_HOST}:${CDP_PORT}...`);
+  try {
+    const browser = await chromium.connectOverCDP(`http://${CDP_HOST}:${CDP_PORT}`);
+    return { browser, launched: false };
+  } catch (cdpErr) {
+    // No Chrome listening on the debugging port — launch our own rather than failing.
+    onProgress(5, `No CDP Chrome on :${CDP_PORT} — launching Chrome directly...`);
+    try {
+      return await launchChrome();
+    } catch (launchErr) {
+      throw new Error(
+        `Could not attach to Chrome on ${CDP_HOST}:${CDP_PORT} (${cdpErr.message}) ` +
+          `and could not launch Chrome directly (${launchErr.message}). ` +
+          `Either run "npm run start:chrome", or make sure Google Chrome is installed.`
+      );
+    }
+  }
 }
 
 async function tramadaLogin(page, username, password) {
@@ -272,10 +325,9 @@ async function runTramadaAddAndSearch({
 
   const mapped = mapJetstarToTramada(booking, clientCode);
 
-  let browser, context, page;
+  let browser, context, page, launched = false;
   try {
-    onProgress(5, `Connecting to CDP Chrome at ${CDP_HOST}:${CDP_PORT}...`);
-    browser = await chromium.connectOverCDP(`http://${CDP_HOST}:${CDP_PORT}`);
+    ({ browser, launched } = await openBrowser(onProgress));
     const contexts = browser.contexts();
     context = contexts[0] || (await browser.newContext());
     page = await context.newPage();
@@ -336,6 +388,8 @@ async function runTramadaAddAndSearch({
       if (page) await page.close();
     } catch { /* tab may already be closed */ }
     try {
+      // If we launched Chrome this shuts it down; if we attached over CDP it only
+      // drops the connection, leaving the user's Chrome running.
       if (browser) await browser.close();
     } catch { /* CDP disconnect */ }
   }

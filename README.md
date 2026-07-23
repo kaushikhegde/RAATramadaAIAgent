@@ -51,6 +51,22 @@ npm start                 # same without DEBUG
 ### 5. Open the chat
 Navigate to http://localhost:3000 in your browser.
 
+### Tramada-only mode (skip Jetstar)
+
+To collect details in the chat and record the booking straight into Tramada — no Jetstar
+automation, no `--remote-debugging-port` needed:
+
+```bash
+SKIP_JETSTAR=true CDP_MODE=internal node server.js
+```
+
+- `SKIP_JETSTAR=true` — after you confirm, the Tramada form appears immediately. The chat
+  also stops asking for Jetstar-only details (contact email/phone, budget, baggage, seats,
+  insurance) and asks which client to file the booking under instead.
+- `CDP_MODE=internal` — launches Chrome directly instead of attaching to port 9222.
+  In `external` mode the Tramada automation still falls back to launching Chrome if
+  nothing is listening on the CDP port, so this is optional.
+
 ## How It Works
 
 1. Open http://localhost:3000 — the chat UI connects via WebSocket
