@@ -137,16 +137,26 @@ async function fillIf(page, selector, value) {
   await first.fill(String(value), { timeout: 10000 });
 }
 
+// Set a <select> instantly by matching value, exact label, or label-contains.
+// (Playwright's selectOption WAITS 30s per failed attempt when the value
+// doesn't exactly match an option — "Adult" vs value "ADULT", "Published" vs
+// label "Published [PUBLISHED]" — which is what made costing take minutes.)
 async function selectIf(page, selector, value) {
   if (value == null || value === "") return;
   const el = page.locator(selector);
   if (!(await el.count())) return;
-  // Try by value, then by label.
-  try {
-    await el.first().selectOption(value);
-  } catch {
-    try { await el.first().selectOption({ label: String(value) }); } catch { /* leave default */ }
-  }
+  await el.first().evaluate((sel, want) => {
+    const w = String(want).trim().toLowerCase();
+    const opts = Array.from(sel.options || []);
+    const hit =
+      opts.find((o) => (o.value || "").toLowerCase() === w) ||
+      opts.find((o) => (o.textContent || "").trim().toLowerCase() === w) ||
+      opts.find((o) => (o.textContent || "").toLowerCase().includes(w));
+    if (hit) {
+      sel.value = hit.value;
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+  }, String(value)).catch(() => { /* leave default */ });
 }
 
 // In-page finder for the best autocomplete suggestion for the input given by
@@ -351,12 +361,26 @@ async function setMoneyField(page, selector, value) {
 }
 
 /**
- * Click Save and WAIT for a definitive outcome: either the page navigates away
- * from the *-segment form (success) or an error box appears (real rejection).
- * A fixed post-click sleep raced the server — on a slow save the check fired
- * while the submit was still in flight, producing a false "did not save" with
- * a perfectly-filled, error-free form left on screen. Polls up to ~15s and
- * re-clicks Save once midway in case the first click was swallowed.
+ * Has the segment form reached a SAVED state? Two distinct success shapes:
+ *  - Flights: Tramada NAVIGATES back to the itinerary list.
+ *  - Hotels: Tramada RELOADS THE SAME FORM in edit mode — the URL gains an id
+ *    and the "Segment Created :" header gets a timestamp. Treating that as
+ *    "not saved" made the code re-click Save and record the segment again.
+ */
+async function segmentFormSaved(page) {
+  const url = page.url();
+  if (!/-segment\.htm/i.test(url)) return true; // navigated away → saved
+  if (/[?&]id=\d+/.test(url)) return true; // form reloaded in EDIT mode → saved
+  return await page.evaluate(() => {
+    const m = (document.body.innerText || "").match(/Segment Created\s*:\s*([^\n]+)/i);
+    return !!(m && m[1] && m[1].trim()); // "Segment Created : Fri 24 Jul ..." → saved
+  }).catch(() => false);
+}
+
+/**
+ * Click Save and WAIT for a definitive outcome: a saved state (navigation OR
+ * edit-mode reload) or an error box. Polls up to ~15s; re-clicks Save once
+ * midway ONLY while the form is still verifiably unsaved.
  */
 async function saveSegmentForm(page) {
   const clickSave = async () => {
@@ -365,31 +389,27 @@ async function saveSegmentForm(page) {
   await clickSave();
   for (let i = 0; i < 25; i++) {
     await sleep(600);
-    if (!/-segment\.htm/i.test(page.url())) return; // navigated → saved
+    if (await segmentFormSaved(page)) return; // saved (either shape)
     const errs = await readSaveErrors(page);
     if (errs.length) return; // rejected with visible errors → assertSaved reports them
-    if (i === 8) await clickSave(); // ~5s in and nothing happened — click once more
+    if (i === 8) await clickSave(); // ~5s in, still unsaved and error-free — click once more
   }
 }
 
-// After a segment save, confirm it actually persisted. Tramada redirects to the
-// itinerary/costing list on success; if we're still on the *-segment form, the
-// save was rejected (usually validation) — surface it loudly instead of the
-// misleading downstream "no itinerary segment". Saves a screenshot of the
-// failed form to last-error.png so the state is inspectable afterwards.
+// After a segment save, confirm it actually persisted (either success shape).
+// Only an unsaved form is a failure — surfaced with the on-page validation
+// text and a screenshot in last-error.png.
 async function assertSaved(page, kind) {
-  const stillOnForm = /-segment\.htm/i.test(page.url());
+  if (await segmentFormSaved(page)) return;
   const errors = await readSaveErrors(page);
-  if (stillOnForm || errors.length) {
-    let shot = "";
-    try {
-      await page.screenshot({ path: "last-error.png", fullPage: true });
-      shot = " [screenshot: last-error.png]";
-    } catch { /* screenshot is best-effort */ }
-    throw new Error(
-      `${kind} did not save${errors.length ? ": " + errors.join("; ") : " (form rejected, no error text found)"}${shot}`
-    );
-  }
+  let shot = "";
+  try {
+    await page.screenshot({ path: "last-error.png", fullPage: true });
+    shot = " [screenshot: last-error.png]";
+  } catch { /* screenshot is best-effort */ }
+  throw new Error(
+    `${kind} did not save${errors.length ? ": " + errors.join("; ") : " (form rejected, no error text found)"}${shot}`
+  );
 }
 
 /* ── Flight segment (details only; not priced) ─────────────────────────── */
@@ -566,6 +586,83 @@ async function readItinerary(page, bookingNo) {
       }
     }
     return [];
+  });
+}
+
+// Booking header details (for the state card): client, itinerary, dates.
+async function readBookingHeader(page, bookingNo) {
+  await page.goto(
+    `${TRAMADA_BASE_URL}/booking/booking-summary.htm?mode=edit&id=${encodeURIComponent(bookingNo)}`,
+    { waitUntil: "domcontentloaded" }
+  );
+  await sleep(500);
+  return await page.evaluate(() => {
+    const text = document.body.innerText || "";
+    const grab = (label) => {
+      const m = text.match(new RegExp(label + "\\s*:?\\s*([^\\n]+)", "i"));
+      return m ? m[1].trim() : "";
+    };
+    return {
+      bookingNo: grab("Booking No\\.?"),
+      client: grab("Client"),
+      clientName: grab("Client Name"),
+      itinerary: grab("Itinerary"),
+      bookDate: grab("Book\\.? Date"),
+      depDate: grab("Dep\\.? Date"),
+      totalDue: grab("Total Client/Debtor Due"),
+      receipted: grab("Client/Debtor Receipted"),
+      balance: grab("Client/Debtor Balance"),
+    };
+  });
+}
+
+// Existing receipts on the booking (part-payments visible in the state card).
+async function readReceiptsList(page, bookingNo) {
+  await page.goto(
+    `${TRAMADA_BASE_URL}/booking/booking-receipts.htm?mode=edit&id=${encodeURIComponent(bookingNo)}`,
+    { waitUntil: "domcontentloaded" }
+  );
+  await sleep(500);
+  return await page.evaluate(() => {
+    const clean = (el) => (el && el.textContent ? el.textContent.trim() : "");
+    for (const t of document.querySelectorAll("table")) {
+      const h = t.querySelector("tr");
+      if (h && /Receipt\s*No/i.test(h.textContent)) {
+        const out = [];
+        const rows = t.querySelectorAll("tr");
+        for (let i = 1; i < rows.length; i++) {
+          const c = rows[i].querySelectorAll("td");
+          if (c.length >= 9 && /^R\./i.test(clean(c[1]))) {
+            out.push({
+              receiptNo: clean(c[1]),
+              transType: clean(c[4]),
+              reference: clean(c[6]),
+              dateReceived: clean(c[7]),
+              amount: clean(c[8]),
+              allocated: clean(c[9]),
+            });
+          }
+        }
+        return out;
+      }
+    }
+    return [];
+  });
+}
+
+/**
+ * Read the full state of a booking in one pass: header, itinerary segments,
+ * costing lines, and receipts. Powers the "what's already here" summary card
+ * and the assistant's suggestions (e.g. remaining balance).
+ */
+async function runReadBookingState({ username, password, bookingNo, callbacks = {} } = {}) {
+  if (!bookingNo) throw new Error("bookingNo required");
+  return await withPage({ username, password, callbacks }, async (page) => {
+    const header = await readBookingHeader(page, bookingNo);
+    const segments = await readItinerary(page, bookingNo);
+    const costings = await readCostings(page, bookingNo);
+    const receipts = await readReceiptsList(page, bookingNo);
+    return { bookingNo: String(bookingNo), header, segments, costings, receipts };
   });
 }
 
@@ -796,15 +893,21 @@ async function runFullBooking({
       onStage("costing", costResult);
     }
 
-    // 4) Receipt (preview by default; caller confirms, then re-run with dryRunReceipt=false).
-    onProgress(75, dryRunReceipt ? "Building receipt preview..." : "Issuing receipt...");
-    const receiptResult = await runTramadaReceipt({
-      username, password, bookingNo, receipt, dryRun: dryRunReceipt,
-      callbacks: { onNeedLogin, onProgress: (p, m) => onProgress(75 + Math.round(p * 0.24), m) },
-    });
-    onStage("receipt", receiptResult);
+    // 5) Receipt — OPTIONAL: only when receipt details were provided. This lets
+    //    the assistant run segments/costing-only jobs on existing bookings.
+    let receiptResult = null;
+    if (receipt && receipt.reference) {
+      onProgress(75, dryRunReceipt ? "Building receipt preview..." : "Issuing receipt...");
+      receiptResult = await runTramadaReceipt({
+        username, password, bookingNo, receipt, dryRun: dryRunReceipt,
+        callbacks: { onNeedLogin, onProgress: (p, m) => onProgress(75 + Math.round(p * 0.24), m) },
+      });
+      onStage("receipt", receiptResult);
+    } else {
+      onProgress(95, "No receipt requested — skipping receipt stage.");
+    }
 
-    onProgress(100, dryRunReceipt ? "Pipeline ready (receipt not committed)." : "Pipeline complete.");
+    onProgress(100, dryRunReceipt && receiptResult ? "Pipeline ready (receipt not committed)." : "Pipeline complete.");
     return { bookingNo, booking: addRes.add, segments: segResult, costing: costResult, receipt: receiptResult };
   } catch (err) {
     onError(err.message);
@@ -814,6 +917,7 @@ async function runFullBooking({
 
 module.exports = {
   runFullBooking,
+  runReadBookingState,
   runAddPassenger,
   runAddSegments,
   runAddCostings,

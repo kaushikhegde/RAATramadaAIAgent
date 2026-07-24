@@ -595,7 +595,7 @@
     <div class="input-area">
       <input type="file" id="pdfInput" accept=".pdf">
       <button class="upload-btn" onclick="document.getElementById('pdfInput').click()" title="Upload PDF">&#128206;</button>
-      <input type="text" id="userInput" placeholder="Tell me where you'd like to fly..."
+      <input type="text" id="userInput" placeholder="Type a message..."
              onkeydown="if(event.key==='Enter' && !event.shiftKey) sendMessage()">
       <button class="send-btn" id="sendBtn" onclick="sendMessage()">&#10148;</button>
     </div>
@@ -765,6 +765,22 @@
       case 'tramada_results':
         showTramadaSearchResults(data.data);
         break;
+      case 'booking_list':
+        showBookingList(data.bookings);
+        break;
+      case 'booking_state':
+        showBookingState(data.state);
+        break;
+      case 'pipeline_progress':
+        updateTramadaProgress(data.percent, data.message);
+        break;
+      case 'pipeline_stage':
+        break; // progress card already reflects stages
+      case 'pipeline_complete': {
+        const pc = document.getElementById('tramadaProgressCard');
+        if (pc) pc.removeAttribute('id'); // freeze card; next run gets a fresh one
+        break;
+      }
       case 'tramada_complete':
         addBotMessage('&#9989; Tramada done.');
         break;
@@ -935,6 +951,62 @@
         </div>
       </div>
     `;
+    chatContainer.appendChild(wrapper);
+    scrollToBottom();
+  }
+
+  // ── Assistant mode cards ──
+  const escHtml = (s) => String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/'/g, '&#39;').replace(/"/g, '&quot;');
+
+  function showBookingList(bookings) {
+    const rows = (bookings || []).slice(0, 15).map((b) => `
+      <div class="summary-row">
+        <span class="label"><button class="quick-reply-btn" onclick="sendQuickReply('Open ${escHtml(b.bookingNo)}')">${escHtml(b.bookingNo)}</button></span>
+        <span>${escHtml(b.clientName)} &middot; ${escHtml(b.itinerary)} &middot; dep ${escHtml(b.depDate)}</span>
+      </div>`).join('') ||
+      '<div class="summary-row"><span class="label">No bookings found</span><span></span></div>';
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message bot';
+    wrapper.innerHTML = `
+      <div class="avatar">R</div>
+      <div><div class="summary-card"><h3>&#128203; Bookings</h3>${rows}</div></div>`;
+    chatContainer.appendChild(wrapper);
+    scrollToBottom();
+  }
+
+  function showBookingState(state) {
+    const h = (state && state.header) || {};
+    const sec = (title) =>
+      `<div class="summary-row"><span class="label" style="font-weight:600;opacity:1">${title}</span><span></span></div>`;
+    const none = '<div class="summary-row"><span class="label" style="opacity:.5">none yet</span><span></span></div>';
+
+    const segs = (state.segments || []).map((s) =>
+      `<div class="summary-row"><span class="label">${escHtml(s.segType)}</span><span>${escHtml(s.reference)}</span></div>`
+    ).join('') || none;
+    const costs = (state.costings || []).map((c) =>
+      `<div class="summary-row"><span class="label">${escHtml(c.segType)} ${escHtml(c.reference)}</span><span>${escHtml(c.dueIncGst)}</span></div>`
+    ).join('') || none;
+    const rcpts = (state.receipts || []).map((r) =>
+      `<div class="summary-row"><span class="label">${escHtml(r.receiptNo)} (${escHtml(r.transType)})</span><span>${escHtml(r.amount)} &middot; alloc ${escHtml(r.allocated)}</span></div>`
+    ).join('') || none;
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message bot';
+    wrapper.innerHTML = `
+      <div class="avatar">R</div>
+      <div><div class="summary-card">
+        <h3>&#128196; Booking ${escHtml(state.bookingNo)}</h3>
+        <div class="summary-row"><span class="label">Client</span><span>${escHtml(h.clientName || h.client)}</span></div>
+        <div class="summary-row"><span class="label">Itinerary</span><span>${escHtml(h.itinerary)}</span></div>
+        <div class="summary-row"><span class="label">Departure</span><span>${escHtml(h.depDate)}</span></div>
+        ${sec('Segments')}${segs}
+        ${sec('Costing (due inc GST)')}${costs}
+        ${sec('Receipts')}${rcpts}
+        <div class="summary-row"><span class="label">Total due</span><span>${escHtml(h.totalDue)}</span></div>
+        <div class="summary-row"><span class="label">Receipted</span><span>${escHtml(h.receipted)}</span></div>
+        <div class="summary-row"><span class="label">Balance</span><span>${escHtml(h.balance)}</span></div>
+      </div></div>`;
     chatContainer.appendChild(wrapper);
     scrollToBottom();
   }

@@ -156,21 +156,56 @@ async function ensureLoggedIn(page, { username, password, onNeedLogin } = {}) {
  *
  * @param {object} opts { status?: NEW|QUOTE|BOOKED|FINALISED|CANCELLED, clientName?, bookingNo? }
  */
+// Fill a sidebar search field located by its LABEL text (the input ids vary
+// per tenant; the labels don't). Sets value with proper events.
+async function fillSearchFieldByLabel(page, labelText, value) {
+  if (!value) return false;
+  return await page.evaluate((arg) => {
+    const leaves = Array.from(document.querySelectorAll("body *")).filter(
+      (n) => n.children.length === 0 && (n.textContent || "").trim().toLowerCase() === arg.label.toLowerCase()
+    );
+    for (const lb of leaves) {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+      walker.currentNode = lb;
+      let n;
+      while ((n = walker.nextNode())) {
+        if (n.tagName === "INPUT" && (!n.type || n.type === "text")) {
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+          setter.call(n, arg.value);
+          n.dispatchEvent(new Event("input", { bubbles: true }));
+          n.dispatchEvent(new Event("change", { bubbles: true }));
+          return true;
+        }
+      }
+    }
+    return false;
+  }, { label: labelText, value: String(value) });
+}
+
 async function searchBookings(page, opts = {}) {
   await page.goto(`${TRAMADA_BASE_URL}/booking/booking-search.htm`, {
     waitUntil: "domcontentloaded",
   });
   await page.waitForSelector("#searchButton", { timeout: 15000 });
 
+  const hasFilters = !!(opts.status || opts.bookingNo || (opts.clientName || "").trim());
+
+  // NO filters → the landing page ALREADY shows "Recently Accessed Bookings".
+  // Clicking Search with empty criteria returns an empty set on this tenant
+  // (which read as "No bookings found") — so just scrape the recent list.
+  if (!hasFilters) {
+    await sleep(600);
+    return await scrapeBookingList(page);
+  }
+
   if (opts.status) {
     await page.selectOption("#searchForm_bookingStatus", opts.status).catch(() => {});
   }
-  // Booking No / Client Name filters are optional; fill if the page exposes them.
   if (opts.bookingNo) {
-    await page.fill("#searchForm_bookingNo", String(opts.bookingNo)).catch(() => {});
+    await fillSearchFieldByLabel(page, "Booking No", opts.bookingNo);
   }
   if (opts.clientName) {
-    await page.fill("#searchForm_clientName", opts.clientName).catch(() => {});
+    await fillSearchFieldByLabel(page, "Client Name", opts.clientName);
   }
 
   await page.click("#searchButton");
