@@ -97,16 +97,11 @@ async function openBrowser(onProgress) {
     const browser = await chromium.connectOverCDP(`http://${CDP_HOST}:${CDP_PORT}`);
     return { browser, launched: false };
   } catch (cdpErr) {
-    onProgress(5, `No CDP Chrome on :${CDP_PORT} — launching Chrome directly...`);
-    try {
-      return await launchChrome();
-    } catch (launchErr) {
-      throw new Error(
-        `Could not attach to Chrome on ${CDP_HOST}:${CDP_PORT} (${cdpErr.message}) ` +
-          `and could not launch Chrome directly (${launchErr.message}). ` +
-          `Either run "npm run start:chrome", or make sure Google Chrome is installed.`
-      );
-    }
+    // Fail honestly rather than launching an unauthenticated throwaway Chrome.
+    throw new Error(
+      `Could not connect to Chrome on ${CDP_HOST}:${CDP_PORT}. ` +
+        `Run "npm run start:chrome" and log into Tramada IN THAT WINDOW first. [${cdpErr.message}]`
+    );
   }
 }
 
@@ -116,31 +111,38 @@ async function openBrowser(onProgress) {
  * If the session is already warm (attached CDP Chrome), it just returns —
  * so a browser a human already signed into (past OTP) is reused as-is.
  */
-async function ensureLoggedIn(page, { username, password } = {}) {
-  await page.goto(`${TRAMADA_BASE_URL}/login.htm`, { waitUntil: "domcontentloaded" });
-  if (!page.url().includes("login.htm")) return; // already authenticated
+// Reliable auth check via a PROTECTED page (login.htm serves the form even when
+// authenticated, which false-alarms as "not logged in").
+async function tramadaIsAuthed(page) {
+  await page
+    .goto(`${TRAMADA_BASE_URL}/home/home.htm`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  return !page.url().includes("login.htm");
+}
 
-  if (!username || !password) {
-    throw new Error(
-      "Tramada session is not logged in and no credentials were provided. " +
-        "Sign in to Tramada in the shared Chrome first (this also clears the OTP step), " +
-        "or pass username/password."
-    );
+async function ensureLoggedIn(page, { username, password, onNeedLogin } = {}) {
+  if (await tramadaIsAuthed(page)) return; // warm session — nothing to do
+
+  if (username && password) {
+    await page.goto(`${TRAMADA_BASE_URL}/login.htm`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#username", { state: "visible", timeout: 15000 });
+    await page.fill("#username", username);
+    await page.fill("#loginForm_password", password);
+    await page.click("#loginForm_login");
+    await page.waitForURL((u) => !u.toString().includes("login.htm"), { timeout: 30000 }).catch(() => {});
+    if (page.url().includes("login.htm")) throw new Error("Tramada login failed (check credentials / OTP).");
+    await sleep(500);
+    return;
   }
 
-  await page.waitForSelector("#username", { state: "visible", timeout: 15000 });
-  await page.fill("#username", username);
-  await page.fill("#loginForm_password", password);
-  await page.click("#loginForm_login");
-  try {
-    await page.waitForURL((u) => !u.toString().includes("login.htm"), { timeout: 30000 });
-  } catch {
-    if (page.url().includes("login.htm")) {
-      throw new Error("Tramada login failed (still on login.htm — check credentials or OTP).");
-    }
+  // No credentials — ask the user to sign in and WAIT (don't quit the run).
+  if (typeof onNeedLogin === "function") onNeedLogin();
+  const deadline = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < deadline) {
+    await sleep(3000);
+    if (await tramadaIsAuthed(page)) { await sleep(500); return; }
   }
-  await page.waitForLoadState("domcontentloaded");
-  await sleep(500);
+  throw new Error("Timed out waiting for Tramada login. Sign in to the shared Chrome and try again.");
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -313,34 +315,53 @@ async function readAllocatableSegments(page) {
  * Open a fresh Debtor Payment Receipt form for a booking and fill the header
  * fields. Returns the list of allocatable segments so the caller can allocate.
  */
+// Set a field with native setter + input/change/blur events — the method the
+// two successful hand-driven receipts used (matches the browser extension's
+// form_input). Plain Playwright fill() skips the change handlers Tramada uses.
+async function setFieldWithEvents(page, selector, value) {
+  if (value == null || value === "") return;
+  const el = page.locator(selector);
+  if (!(await el.count())) return;
+  await el.first().evaluate((n, v) => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+    setter.call(n, v);
+    n.dispatchEvent(new Event("input", { bubbles: true }));
+    n.dispatchEvent(new Event("change", { bubbles: true }));
+    n.dispatchEvent(new Event("blur", { bubbles: true }));
+  }, String(value));
+}
+
 async function openReceiptForm(page, bookingNo, receipt) {
+  // PROVEN PATH: open the Receipts list and click "Add / Issue Receipt".
+  // (Navigating straight to the form URL once ended in a Tramada server error
+  // on Issue — the button flow is what both successful receipts used.)
   await page.goto(
-    `${TRAMADA_BASE_URL}/booking/booking-debtor-payment-receipt.htm` +
-      `?mode=add&isMigrationReceipt=false&isPxIssue=false` +
-      `&parentId=${encodeURIComponent(bookingNo)}&isAgencyCreditCardReceipt=false`,
+    `${TRAMADA_BASE_URL}/booking/booking-receipts.htm?mode=edit&id=${encodeURIComponent(bookingNo)}`,
     { waitUntil: "domcontentloaded" }
   );
-  await page.waitForSelector("#receipttransactionTypeCode", { timeout: 15000 });
+  await page.waitForSelector('input[value="Add / Issue Receipt"]', { timeout: 15000 });
+  await page.click('input[value="Add / Issue Receipt"]');
+  await page.waitForSelector("#receipttransactionTypeCode", { timeout: 20000 });
 
   const txn = resolveTxnType(receipt.transactionType);
 
   // Transaction Type (req 2) — set first so credit-card sections render.
   await page.selectOption("#receipttransactionTypeCode", txn);
-  await sleep(600);
+  await sleep(800);
 
   // Payer Name = booking client name (business rule, req: always client name).
   if (receipt.payerName) {
-    await page.fill("#receiptpayerName", receipt.payerName);
+    await setFieldWithEvents(page, "#receiptpayerName", receipt.payerName);
   }
   // Date Received (defaults to today if omitted).
-  await page.fill("#receiptdateReceived", toTramadaDate(receipt.dateReceived));
+  await setFieldWithEvents(page, "#receiptdateReceived", toTramadaDate(receipt.dateReceived));
   // Amount Received.
-  await page.fill("#receiptreceiptAmount", String(receipt.amount));
+  await setFieldWithEvents(page, "#receiptreceiptAmount", String(receipt.amount));
   // Reference — REQUIRED (req 6).
   if (!receipt.reference) {
     throw new Error("Receipt reference is required.");
   }
-  await page.fill("#receiptreferenceNumber", String(receipt.reference));
+  await setFieldWithEvents(page, "#receiptreferenceNumber", String(receipt.reference));
 
   return { txn, segments: await readAllocatableSegments(page) };
 }
@@ -430,16 +451,38 @@ async function allocateSegments(page, allocation, segments) {
   }
 
   if (allocation === "ALL" || allocation == null) {
-    // Tick every segment checkbox and keep the pre-filled due amount.
+    // PROVEN PATH: real-click the "Segments To Allocate" section's Select All
+    // button — its onclick both ticks every row AND auto-fills each allocation
+    // amount with the segment's due. (Hand-ticking checkboxes left the amounts
+    // empty, which is what sank the first manual attempt.) There are two
+    // #selectAll buttons on the page; the segments one is the second.
+    const selectAlls = page.locator("#selectAll");
+    const n = await selectAlls.count();
+    if (n > 0) {
+      await selectAlls.nth(n - 1).click();
+      await sleep(800);
+    }
+    // Verify: every checkbox ticked and amounts populated; fix up any gaps the
+    // button missed using the segment's own due value.
     await page.evaluate(() => {
-      document
-        .querySelectorAll('input[name="segmentsToAllocate"]')
-        .forEach((cb) => {
-          if (!cb.checked) {
-            cb.checked = true;
-            cb.dispatchEvent(new Event("change", { bubbles: true }));
+      document.querySelectorAll('input[id^="allocationAmount_"]').forEach((inp) => {
+        const row = inp.closest("tr");
+        const cb = row && row.querySelector('input[name="segmentsToAllocate"]');
+        if (cb && !cb.checked) {
+          cb.checked = true;
+          cb.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        if (!parseFloat(inp.value || "0")) {
+          const cells = row ? Array.from(row.querySelectorAll("td")).map((td) => td.textContent.trim()) : [];
+          const due = cells.filter((c) => /^\d+(\.\d\d)?$/.test(c)).pop();
+          if (due) {
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+            setter.call(inp, due);
+            inp.dispatchEvent(new Event("input", { bubbles: true }));
+            inp.dispatchEvent(new Event("change", { bubbles: true }));
           }
-        });
+        }
+      });
     });
     return;
   }
@@ -451,8 +494,8 @@ async function allocateSegments(page, allocation, segments) {
         ? segments.find((s) => s.segId === String(a.segId))
         : segments[a.index];
     if (!seg) continue;
-    // Set amount and tick the row's checkbox.
-    await page.fill(`#allocationAmount_${seg.segId}`, String(a.amount));
+    // Set amount (with events, so Tramada's tally recomputes) and tick the row.
+    await setFieldWithEvents(page, `#allocationAmount_${seg.segId}`, String(a.amount));
     await page.evaluate((segId) => {
       const inp = document.getElementById("allocationAmount_" + segId);
       const row = inp && inp.closest("tr");
@@ -465,7 +508,8 @@ async function allocateSegments(page, allocation, segments) {
   }
 }
 
-// Read back the top receipt row after issuing.
+// Read back the top REAL receipt row after issuing — skips "No records found"
+// and TOTALS rows; only a row whose Receipt No. looks like "R.000..." counts.
 async function readLatestReceipt(page) {
   return await page.evaluate(() => {
     const clean = (el) => (el && el.textContent ? el.textContent.trim() : "");
@@ -473,7 +517,15 @@ async function readLatestReceipt(page) {
     for (const table of tables) {
       const header = table.querySelector("tr");
       if (header && /Receipt\s*No/i.test(header.textContent)) {
-        const row = table.querySelectorAll("tr")[1];
+        const rows = table.querySelectorAll("tr");
+        let row = null;
+        for (let i = 1; i < rows.length; i++) {
+          const cells = rows[i].querySelectorAll("td");
+          if (cells.length >= 9 && /^R\./i.test((cells[1].textContent || "").trim())) {
+            row = rows[i];
+            break;
+          }
+        }
         if (!row) return null;
         const c = row.querySelectorAll("td");
         return {
@@ -546,13 +598,14 @@ async function runTramadaReceipt({
   }
 
   let browser, context, page, launched = false;
+  let _ok = false;
   try {
     ({ browser, launched } = await openBrowser(onProgress));
     context = browser.contexts()[0] || (await browser.newContext());
     page = await context.newPage();
 
     onProgress(12, "Checking Tramada session...");
-    await ensureLoggedIn(page, { username, password });
+    await ensureLoggedIn(page, { username, password, onNeedLogin: callbacks.onNeedLogin });
 
     onProgress(25, `Opening booking ${bookingNo}...`);
     const details = await getBookingDetails(page, bookingNo);
@@ -604,15 +657,35 @@ async function runTramadaReceipt({
         previewImage = await page.screenshot({ encoding: "base64", fullPage: true });
       } catch { /* screenshot optional */ }
       onProgress(100, "Preview ready.");
+      _ok = true;
       return { details, itinerary: itin, segments, staged, previewImage, committed: false };
     }
 
     onProgress(85, "Issuing receipt...");
-    await Promise.all([
-      page.waitForLoadState("domcontentloaded").catch(() => {}),
-      page.click('input[type="submit"][value="Issue"], input#issue'),
-    ]);
-    await sleep(1500);
+    // Real click on Issue, then WAIT for a definitive outcome: back on the
+    // receipts list (success), a Tramada error page, or on-form validation
+    // errors. A fixed sleep raced the server and produced false successes.
+    await page.click("#issue");
+    for (let i = 0; i < 25; i++) {
+      await sleep(600);
+      const url = page.url();
+      if (/booking-receipts\.htm/i.test(url)) break; // back on the list → issued
+      const title = (await page.title().catch(() => "")) || "";
+      if (/error page/i.test(title)) {
+        throw new Error("Tramada returned a server error page after Issue.");
+      }
+      const errs = await page.evaluate(() => {
+        const out = [];
+        document.querySelectorAll("a, span, li, font, div").forEach((n) => {
+          if (n.children.length) return;
+          const t = (n.textContent || "").trim();
+          if (t && t.length < 200 && /must be|is required|is invalid|cannot be/i.test(t)) out.push(t);
+        });
+        return [...new Set(out)].slice(0, 8);
+      }).catch(() => []);
+      if (errs.length) throw new Error(`Receipt rejected: ${errs.join("; ")}`);
+      if (i === 8) { try { await page.click("#issue", { timeout: 3000 }); } catch { /* busy */ } }
+    }
 
     // Land on the Booking Receipts list and read back the new receipt.
     if (!page.url().includes("booking-receipts")) {
@@ -624,14 +697,25 @@ async function runTramadaReceipt({
     }
     const issued = await readLatestReceipt(page);
 
-    onProgress(100, issued ? `Receipt ${issued.receiptNo} issued.` : "Receipt issued.");
+    // STRICT: success means a real receipt number (R.000...) in the list —
+    // anything else is a failure, never a silent "Receipt issued."
+    if (!issued || !/^R\./i.test(issued.receiptNo || "")) {
+      try { await page.screenshot({ path: "last-error.png", fullPage: true }); } catch { /* best-effort */ }
+      throw new Error(
+        "Receipt was NOT created — the receipts list shows no new receipt. [screenshot: last-error.png]"
+      );
+    }
+
+    onProgress(100, `Receipt ${issued.receiptNo} issued.`);
+    _ok = true;
     return { details, itinerary: itin, segments, staged, receipt: issued, committed: true };
   } catch (err) {
     onError(err.message);
     throw err;
   } finally {
     try {
-      if (page) await page.close();
+      // On failure leave the tab open (failed form stays inspectable).
+      if (page && _ok) await page.close();
     } catch { /* tab may be closed */ }
     try {
       if (browser) await browser.close(); // CDP: only drops the connection

@@ -1,0 +1,63 @@
+{
+  "_comment": "Edit these values freely. Amount must equal flight fare + hotel (rate x nights). Set dryRunReceipt=true to stage the receipt without committing it.",
+  "clientCode": "GRAY/SPIDER",
+  "dryRunReceipt": false,
+  "booking": {
+    "originCode": "MEL",
+    "destinationCode": "SYD",
+    "departureDate": "2026-08-25",
+    "returnDate": "2026-08-28",
+    "adults": 1
+  },
+  "segments": [
+    {
+      "kind": "flight",
+      "airline": "Qantas",
+      "flightNumber": "400",
+      "class": "Y",
+      "fromCity": "MEL",
+      "toCity": "SYD",
+      "departureDate": "2026-08-25",
+      "departureTime": "09:00",
+      "arrivalDate": "2026-08-25",
+      "arrivalTime": "10:25"
+    },
+    {
+      "kind": "flight",
+      "airline": "Qantas",
+      "flightNumber": "400",
+      "class": "Y",
+      "fromCity": "SYD",
+      "toCity": "MEL",
+      "departureDate": "2026-08-28",
+      "departureTime": "09:00",
+      "arrivalDate": "2026-08-28",
+      "arrivalTime": "10:25"
+    },
+    {
+      "kind": "hotel",
+      "hotelSupplier": "HOLIDAY AUTOS",
+      "cityCode": "SYD",
+      "checkInDate": "2026-08-25",
+      "checkOutDate": "2026-08-28",
+      "rate": "200",
+      "rooms": 1,
+      "nights": 3,
+      "creditor": "TEMPO HOLIDAYS"
+    }
+  ],
+  "costings": [
+    {
+      "creditor": "TEMPO HOLIDAYS",
+      "airline": "QF",
+      "class": "Y",
+      "fare": "300"
+    }
+  ],
+  "receipt": {
+    "transactionType": "Cash",
+    "amount": "900",
+    "reference": "JNK-101",
+    "allocation": "ALL"
+  }
+}

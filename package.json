@@ -6,6 +6,8 @@
   "scripts": {
     "start": "CDP_MODE=external node server.js",
     "dev": "CDP_MODE=external DEBUG=true node server.js",
+    "chat": "SKIP_JETSTAR=true PIPELINE_MODE=true CDP_MODE=external DEBUG=true node server.js",
+    "book": "CDP_MODE=external DEBUG=true node run-booking.js",
     "setup": "npm install",
     "validate": "node booking.js --validate-only",
     "book:chrome": "USE_PLAYWRIGHT=true BROWSER_CHANNEL=chrome HEADLESS=false node booking.js",

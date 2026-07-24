@@ -129,42 +129,63 @@ async function openBrowser(onProgress) {
     const browser = await chromium.connectOverCDP(`http://${CDP_HOST}:${CDP_PORT}`);
     return { browser, launched: false };
   } catch (cdpErr) {
-    // No Chrome listening on the debugging port — launch our own rather than failing.
-    onProgress(5, `No CDP Chrome on :${CDP_PORT} — launching Chrome directly...`);
-    try {
-      return await launchChrome();
-    } catch (launchErr) {
-      throw new Error(
-        `Could not attach to Chrome on ${CDP_HOST}:${CDP_PORT} (${cdpErr.message}) ` +
-          `and could not launch Chrome directly (${launchErr.message}). ` +
-          `Either run "npm run start:chrome", or make sure Google Chrome is installed.`
-      );
-    }
+    // In external mode we must attach to the Chrome the user is logged into.
+    // Launching a throwaway Chrome here would be UNAUTHENTICATED and produce a
+    // misleading "not logged in" — so fail honestly instead.
+    throw new Error(
+      `Could not connect to Chrome on ${CDP_HOST}:${CDP_PORT}. ` +
+        `Run "npm run start:chrome" and log into Tramada IN THAT WINDOW first ` +
+        `(it's a separate Chrome from your normal browser). [${cdpErr.message}]`
+    );
   }
 }
 
-async function tramadaLogin(page, username, password) {
-  await page.goto(`${TRAMADA_BASE_URL}/login.htm`, { waitUntil: "domcontentloaded" });
+// Reliable auth check: hit a PROTECTED page and see if Tramada bounces us to
+// login. (Checking login.htm directly is unreliable — Tramada serves the login
+// form there even for authenticated sessions, causing false "not logged in".)
+async function tramadaIsAuthed(page) {
+  await page
+    .goto(`${TRAMADA_BASE_URL}/home/home.htm`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  return !page.url().includes("login.htm");
+}
 
-  // Already logged in? Tramada redirects away from login.htm.
-  if (!page.url().includes("login.htm")) return;
+/**
+ * Ensure the page's Tramada session is authenticated.
+ *  - Warm CDP Chrome already logged in → returns immediately.
+ *  - Credentials provided → logs in programmatically.
+ *  - Otherwise → calls onNeedLogin() and WAITS (polls) for the user to sign in
+ *    manually in the shared Chrome (this is where they enter the OTP), up to 5
+ *    minutes, then continues. It never just quits the run.
+ */
+async function tramadaLogin(page, username, password, onNeedLogin) {
+  if (await tramadaIsAuthed(page)) return;
 
-  await page.waitForSelector("#username", { state: "visible", timeout: 15000 });
-  await page.fill("#username", username);
-  await page.fill("#loginForm_password", password);
-  await page.click("#loginForm_login");
+  if (username && password) {
+    await page.goto(`${TRAMADA_BASE_URL}/login.htm`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#username", { state: "visible", timeout: 15000 });
+    await page.fill("#username", username);
+    await page.fill("#loginForm_password", password);
+    await page.click("#loginForm_login");
+    await page.waitForURL((u) => !u.toString().includes("login.htm"), { timeout: 30000 }).catch(() => {});
+    if (page.url().includes("login.htm")) {
+      throw new Error("Tramada login failed (check credentials / OTP).");
+    }
+    await sleep(500);
+    return;
+  }
 
-  // Wait for a redirect away from login.htm (success) or the login form to re-appear with an error.
-  try {
-    await page.waitForURL((url) => !url.toString().includes("login.htm"), { timeout: 30000 });
-  } catch {
-    const stillOnLogin = page.url().includes("login.htm");
-    if (stillOnLogin) {
-      throw new Error("Tramada login failed (still on login.htm — check credentials).");
+  // No credentials — ask the user to log in and wait for them.
+  if (typeof onNeedLogin === "function") onNeedLogin();
+  const deadline = Date.now() + 5 * 60 * 1000; // 5 minutes for manual login + OTP
+  while (Date.now() < deadline) {
+    await sleep(3000);
+    if (await tramadaIsAuthed(page)) {
+      await sleep(500);
+      return;
     }
   }
-  await page.waitForLoadState("domcontentloaded");
-  await sleep(500);
+  throw new Error("Timed out waiting for Tramada login. Sign in to the shared Chrome and try again.");
 }
 
 async function tramadaAddBooking(page, mapped) {
@@ -195,65 +216,64 @@ async function tramadaAddBooking(page, mapped) {
   }
   await sleep(1500);
 
-  // Mandatory fields
-  await page.selectOption("#bankAccount", mapped.bankAccount);
-  await page.fill("#departureDate", mapped.departureDate);
-  if (mapped.returnDate) await page.fill("#returnDate", mapped.returnDate);
-  await page.selectOption("#bookingTypeCode", mapped.bookingType);
-  await page.selectOption("#sourceTypeCode", mapped.bookingSource);
-  await page.selectOption("#destinationTypeCode", mapped.destination);
-  await page.selectOption("#domIntCode", mapped.domInt);
+  // Mandatory fields. IMPORTANT: picking the client fires an ajax refresh that
+  // re-renders parts of the form and can RESET selects that were set too early
+  // (seen live: "Bank Account must be selected" on save). So set everything,
+  // wait for the refresh to settle, then VERIFY and re-set anything wiped.
+  const setFields = async () => {
+    await page.selectOption("#bankAccount", mapped.bankAccount).catch(() => {});
+    await page.fill("#departureDate", mapped.departureDate);
+    if (mapped.returnDate) await page.fill("#returnDate", mapped.returnDate);
+    await page.selectOption("#bookingTypeCode", mapped.bookingType).catch(() => {});
+    await page.selectOption("#sourceTypeCode", mapped.bookingSource).catch(() => {});
+    await page.selectOption("#destinationTypeCode", mapped.destination).catch(() => {});
+    await page.selectOption("#domIntCode", mapped.domInt).catch(() => {});
+    if (mapped.cabinClass) await page.selectOption("#cabinClassTypeCode", mapped.cabinClass).catch(() => {});
+    if (mapped.itinerary) await page.fill("#itinerarySummary", mapped.itinerary);
+    if (mapped.primaryDest) await page.fill("#destinationCityCode", mapped.primaryDest);
+  };
 
-  // Optional
-  if (mapped.cabinClass) await page.selectOption("#cabinClassTypeCode", mapped.cabinClass);
-  if (mapped.itinerary) await page.fill("#itinerarySummary", mapped.itinerary);
-  if (mapped.primaryDest) await page.fill("#destinationCityCode", mapped.primaryDest);
+  await setFields();
+  await sleep(1500); // let the client-selection ajax finish re-rendering
 
-  await sleep(400);
+  const wiped = await page.evaluate(() => {
+    const v = (id) => { const e = document.getElementById(id); return e ? e.value : null; };
+    return ["bankAccount", "bookingTypeCode", "sourceTypeCode", "destinationTypeCode", "domIntCode"]
+      .filter((id) => !v(id));
+  });
+  if (wiped.length) {
+    await setFields(); // the refresh reset some selects — set them again
+    await sleep(400);
+  }
+
   await page.click("#save");
   await page.waitForLoadState("domcontentloaded");
   await sleep(1500);
 
-  // Errors?
-  const errors = await page.evaluate(() => {
-    const box = document.querySelector(
-      'div[style*="border"][style*="red"], .errorMessages, fieldset[class*="error"]'
-    );
-    if (box) {
-      return box.textContent
-        .trim()
-        .split("\n")
-        .map((s) => s.trim())
-        .filter(Boolean);
-    }
-    const links = document.querySelectorAll('a[href*="error"], span[class*="error"]');
-    return links.length ? Array.from(links).map((e) => e.textContent.trim()) : [];
-  });
-
-  if (errors.length > 0) {
-    throw new Error(`Tramada validation errors: ${errors.join("; ")}`);
-  }
-
-  if (page.url().includes("mode=ADD")) {
-    throw new Error("Tramada save did not complete (still on Add page).");
-  }
-
-  // Pull the new booking number — URL is the reliable source: post-save the page
-  // is /booking-profile.htm?mode=edit&...&id=12506&... — fall back to page text.
+  // Success = an id in the URL (post-save: booking-profile.htm?...&id=12345).
+  // A REJECTED save re-renders the form — sometimes without mode=ADD in the
+  // URL — so key off the id, and if it's missing surface the on-page
+  // validation messages ("Bank Account must be selected", etc.) loudly.
   const url = page.url();
-  let bkgNo = null;
   const urlMatch = url.match(/[?&]id=(\d+)/);
-  if (urlMatch) {
-    bkgNo = urlMatch[1];
-  } else {
-    bkgNo = await page.evaluate(() => {
-      const text = document.body.innerText;
-      const m = text.match(/Booking\s+(\d+)/i) || text.match(/Bkg\s+No\.?\s*(\d+)/i);
-      return m ? m[1] : null;
+  if (!urlMatch) {
+    const errors = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll("a, span, li, font, div").forEach((n) => {
+        if (n.children.length) return;
+        const t = (n.textContent || "").trim();
+        if (t && t.length < 200 && /must be|is required|is invalid|cannot be|already exists/i.test(t)) {
+          out.push(t);
+        }
+      });
+      return [...new Set(out)].slice(0, 8);
     });
+    throw new Error(
+      `Booking save was rejected${errors.length ? ": " + errors.join("; ") : " (no booking id in URL — a required field was missing)"}`
+    );
   }
 
-  return { bookingNo: bkgNo, url };
+  return { bookingNo: urlMatch[1], url };
 }
 
 async function tramadaSearchBooked(page) {
@@ -310,6 +330,7 @@ async function runTramadaAddAndSearch({
   password,
   clientCode,
   booking,
+  skipSearch = false, // pipeline mode: bookingNo comes from the URL; skip the 15s search poll
   callbacks = {},
 } = {}) {
   const onProgress = callbacks.onProgress || (() => {});
@@ -317,7 +338,9 @@ async function runTramadaAddAndSearch({
   const onAddComplete = callbacks.onAddComplete || (() => {});
   const onSearchComplete = callbacks.onSearchComplete || (() => {});
 
-  if (!username || !password) throw new Error("Tramada username and password are required");
+  // Credentials are optional — if the shared Chrome is already logged in,
+  // tramadaLogin() reuses that warm session and skips the login form. We only
+  // fail (inside tramadaLogin) if we actually land on login.htm without creds.
   if (!clientCode) throw new Error("Tramada clientCode is required (e.g. GRAY/SPIDER)");
   if (!booking || !booking.departureDate) {
     throw new Error("booking.departureDate is required for Tramada add");
@@ -326,6 +349,7 @@ async function runTramadaAddAndSearch({
   const mapped = mapJetstarToTramada(booking, clientCode);
 
   let browser, context, page, launched = false;
+  let _ok = false;
   try {
     ({ browser, launched } = await openBrowser(onProgress));
     const contexts = browser.contexts();
@@ -333,10 +357,20 @@ async function runTramadaAddAndSearch({
     page = await context.newPage();
 
     onProgress(15, "Logging into Tramada...");
-    await tramadaLogin(page, username, password);
+    await tramadaLogin(page, username, password, callbacks.onNeedLogin);
 
     onProgress(45, `Adding booking for client "${clientCode}" (${mapped.domInt})...`);
     const addResult = await tramadaAddBooking(page, mapped);
+
+    // Pipeline mode: the booking number is already extracted from the post-save
+    // URL, and the new booking is simply the most recent one — no need to poll
+    // the BOOKED search index (which lags ~15s behind a fresh save).
+    if (skipSearch) {
+      onAddComplete(addResult);
+      onProgress(100, `Booking ${addResult.bookingNo || ""} saved.`.trim());
+      _ok = true;
+      return { add: addResult, bookings: [], mapped };
+    }
 
     // Tramada's BOOKED search index lags a few seconds behind a fresh save.
     // Poll the search up to ~15s and stop early once we can match the new row.
@@ -379,13 +413,16 @@ async function runTramadaAddAndSearch({
     onAddComplete(enrichedAdd);
 
     onProgress(100, summary ? "Tramada done." : "Tramada saved (search row not yet indexed).");
+    _ok = true;
     return { add: enrichedAdd, bookings, mapped };
   } catch (err) {
     onError(err.message);
     throw err;
   } finally {
     try {
-      if (page) await page.close();
+      // On failure leave the tab open so the error state can be inspected;
+      // close it only after a clean run.
+      if (page && _ok) await page.close();
     } catch { /* tab may already be closed */ }
     try {
       // If we launched Chrome this shuts it down; if we attached over CDP it only

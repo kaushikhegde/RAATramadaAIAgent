@@ -21,7 +21,7 @@ const { WebSocket, WebSocketServer } = require("ws");
 const path = require("path");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { runJetstarBooking } = require("./booking");
-const { buildSystemPrompt } = require("./geminiPrompt");
+const { buildSystemPrompt, buildPipelinePrompt } = require("./geminiPrompt");
 const { runTramadaAutomation } = require("./tramada-automator");
 const { runTramadaAddAndSearch } = require("./tramada-booking");
 const { runTramadaReceipt, searchBookingsForReceipt } = require("./tramada-receipt");
@@ -34,6 +34,9 @@ const DEBUG = process.env.DEBUG === "true";
 // Skip the Jetstar browser automation and go straight from chat → Tramada.
 // Tramada only needs chat-collected fields, so nothing from Jetstar is required.
 const SKIP_JETSTAR = process.env.SKIP_JETSTAR === "true";
+// Full "from the top" mode: chat collects booking→segments→costing→receipt and
+// the assistant runs the whole Tramada pipeline (tramada-segments.runFullBooking).
+const PIPELINE_MODE = process.env.PIPELINE_MODE === "true";
 
 function log(...args) {
   if (DEBUG) console.log("[server]", ...args);
@@ -124,7 +127,9 @@ function getGeminiChat() {
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
   const model = genAI.getGenerativeModel({
     model: "gemini-2.5-flash",
-    systemInstruction: buildSystemPrompt({ skipJetstar: SKIP_JETSTAR }),
+    systemInstruction: PIPELINE_MODE
+      ? buildPipelinePrompt()
+      : buildSystemPrompt({ skipJetstar: SKIP_JETSTAR }),
   });
 
   return model.startChat({
@@ -132,7 +137,9 @@ function getGeminiChat() {
     generationConfig: {
       temperature: 0.7,
       topP: 0.9,
-      maxOutputTokens: 1024,
+      // Large enough for the full pipeline JSON (booking + multiple segments +
+      // costing + receipt) — at 1024 a return-trip booking truncates mid-JSON.
+      maxOutputTokens: 4096,
     },
   });
 }
@@ -190,6 +197,25 @@ async function handleUserMessage(session, userText) {
   // Show typing indicator
   sendToClient(ws, { type: "typing" });
 
+  // ── Pipeline mode: run the whole booking→segments→costing→receipt chain ──
+  if (PIPELINE_MODE) {
+    // If a pipeline is staged and the user confirms, run it now.
+    if (
+      session.pendingPipeline &&
+      /(yes|confirm|go|do it|issue|proceed|book it|run it|retry|try again|again|logged ?in|ready|done)/i.test(userText)
+    ) {
+      const intent = session.pendingPipeline;
+      session.pendingPipeline = null;
+      await runPipelineFromChat(session, intent);
+      return;
+    }
+    if (session.pendingPipeline && /^\s*(no|cancel|stop|wait)/i.test(userText)) {
+      session.pendingPipeline = null;
+      sendToClient(ws, { type: "bot_message", text: "No worries — cancelled. Tell me what to change." });
+      return;
+    }
+  }
+
   // Check if user confirmed booking
   if (
     session.bookingData &&
@@ -232,6 +258,33 @@ async function handleUserMessage(session, userText) {
     // Send user message to Gemini
     const result = await session.geminiChat.sendMessage(userText);
     const response = result.response.text();
+
+    // Pipeline mode: look for the {"intent":"pipeline"} JSON. If present, stage
+    // it and ask the user to confirm; otherwise just relay the chat.
+    if (PIPELINE_MODE) {
+      let pipe = parsePipelineIntent(response);
+      // JSON started but didn't parse (e.g. truncated) → ask Gemini to re-emit
+      // it compact, so a broken block is never shown or left half-run.
+      if (!pipe.intent && /"intent"\s*:\s*"pipeline"/.test(response)) {
+        sendToClient(ws, { type: "bot_message", text: "Finalising your booking — one sec…" });
+        try {
+          const retry = await session.geminiChat.sendMessage(
+            "Output ONLY the pipeline JSON object again, minified on a single line, no code fences, no other text."
+          );
+          pipe = parsePipelineIntent(retry.response.text());
+        } catch { /* fall through */ }
+      }
+      if (pipe.intent) {
+        const human = stripJson(pipe.text);
+        if (human) sendToClient(ws, { type: "bot_message", text: human });
+        sendToClient(ws, { type: "bot_message", text: summarizePipeline(pipe.intent) });
+        await runPipelineFromChat(session, pipe.intent);
+        return;
+      }
+      // No JSON — normal chat. Never show a raw/partial JSON fragment.
+      sendToClient(ws, { type: "bot_message", text: stripJson(response) || response });
+      return;
+    }
 
     // Parse Gemini response — check if it contains JSON booking data
     const parsed = parseGeminiResponse(response);
@@ -743,6 +796,95 @@ async function handlePipelineRun(session, msg) {
     });
   } catch (err) {
     sendToClient(ws, { type: "error", text: `Pipeline failed: ${err.message}` });
+  }
+}
+
+// ─── Pipeline chat helpers ───────────────────────────────────────
+// Remove any JSON (fenced or bare, even if truncated/unclosed) from display text.
+function stripJson(t) {
+  if (!t) return t;
+  return String(t)
+    .replace(/```[\s\S]*$/g, "")              // any code fence to end (handles unclosed)
+    .replace(/\{[\s\S]*"intent"[\s\S]*$/g, "") // bare JSON fragment to end
+    .trim();
+}
+
+// Pull a {"intent":"pipeline", ...} JSON block out of a Gemini reply.
+function parsePipelineIntent(response) {
+  const candidates = [];
+  const fenced = response.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenced) candidates.push(fenced[1]);
+  const bare = response.match(/\{[\s\S]*"intent"\s*:\s*"pipeline"[\s\S]*\}/);
+  if (bare) candidates.push(bare[0]);
+  for (const c of candidates) {
+    try {
+      const data = JSON.parse(c);
+      if (data && data.intent === "pipeline" && data.clientCode && data.receipt) {
+        return { intent: data, text: stripJson(response) };
+      }
+    } catch { /* try next candidate */ }
+  }
+  return { intent: null, text: response };
+}
+
+function summarizePipeline(p) {
+  const segs = (p.segments || [])
+    .map((s) => (s.kind === "flight" ? `✈️ ${s.airline} ${s.flightNumber} ${s.fromCity}→${s.toCity}` : `🏨 ${s.hotelSupplier || s.hotelName} (${s.nights}n @ ${s.rate})`))
+    .join("  ·  ");
+  return (
+    `Here's the full booking I'll record:\n` +
+    `• Client: ${p.clientCode}\n` +
+    `• ${segs}\n` +
+    `• Receipt: ${p.receipt.transactionType} ${p.receipt.amount} (ref ${p.receipt.reference})`
+  );
+}
+
+// Run the whole pipeline from a confirmed chat intent, streaming progress.
+async function runPipelineFromChat(session, intent) {
+  const { ws } = session;
+  sendToClient(ws, { type: "bot_message", text: "Beauty — opening Tramada and recording it now. I'll keep you posted…" });
+  try {
+    const result = await runFullBooking({
+      username: process.env.TRAMADA_USERNAME,
+      password: process.env.TRAMADA_PASSWORD,
+      clientCode: intent.clientCode,
+      booking: intent.booking,
+      segments: intent.segments || [],
+      costings: intent.costings || [],
+      receipt: intent.receipt,
+      dryRunReceipt: false, // the user already confirmed in chat
+      callbacks: {
+        onProgress: (pct, m) => session.active && sendToClient(ws, { type: "pipeline_progress", percent: pct, message: m }),
+        onStage: (name, data) => session.active && sendToClient(ws, { type: "pipeline_stage", stage: name, data }),
+        onError: (m) => session.active && sendToClient(ws, { type: "error", text: `Tramada: ${m}` }),
+        // Not logged in → tell the user and WAIT (the automation polls up to 5 min).
+        onNeedLogin: () =>
+          session.active &&
+          sendToClient(ws, {
+            type: "bot_message",
+            text: "🔐 I need you signed into Tramada in the Chrome window on port 9222. Log in there now (including OTP) — I'll detect it and keep going automatically, no need to touch this chat.",
+          }),
+      },
+    });
+    const rc = result.receipt && result.receipt.receipt;
+    sendToClient(ws, { type: "pipeline_complete", result });
+    sendToClient(ws, {
+      type: "bot_message",
+      text: rc
+        ? `Done ✅ Booking ${result.bookingNo} created and receipt ${rc.receiptNo} issued for ${rc.amount}.`
+        : `Done ✅ Booking ${result.bookingNo} — pipeline complete.`,
+    });
+  } catch (err) {
+    // Keep the collected booking so the user can retry without re-entering it.
+    session.pendingPipeline = intent;
+    sendToClient(ws, { type: "error", text: `Pipeline failed: ${err.message}` });
+    const needsLogin = /not logged in|login/i.test(err.message);
+    sendToClient(ws, {
+      type: "bot_message",
+      text: needsLogin
+        ? "Your booking is saved here — nothing lost. Sign into Tramada in the Chrome window that `npm run start:chrome` opened (port 9222 — NOT your normal browser), then reply **retry** and I'll run the exact same booking again."
+        : "Your booking is saved here — reply **retry** to run it again, or tell me what to change.",
+    });
   }
 }
 
