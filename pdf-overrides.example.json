@@ -1,0 +1,9 @@
+{
+  "_comment": "OPTIONAL. The RAA PDF names products/suppliers (Tour East Bali, Novotel, Tokio Marine) but not always the Tramada CREDITOR that gets paid. If typing the supplier name into Tramada's creditor autocomplete doesn't match, pin the creditor here by segment/line kind. Copy this file to pdf-overrides.json, edit, and run:  npm run pdf -- itinerary.pdf --overrides pdf-overrides.json",
+  "creditors": {
+    "tour": "Viva Holidays",
+    "hotel": "",
+    "insurance": "Tokio Marine"
+  },
+  "includeServiceFee": false
+}

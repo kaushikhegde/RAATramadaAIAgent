@@ -472,17 +472,19 @@
   .input-area button.send-btn:disabled { background: #D9D5CC; cursor: not-allowed; }
 
   .upload-btn {
-    width: 40px;
     height: 40px;
+    padding: 0 14px;
     border: 1px dashed var(--raa-text-light);
     background: transparent;
     color: var(--raa-text-light);
-    border-radius: 50%;
+    border-radius: 20px;
     cursor: pointer;
-    font-size: 16px;
+    font-size: 13px;
+    font-weight: 600;
     display: flex;
     align-items: center;
-    justify-content: center;
+    gap: 6px;
+    white-space: nowrap;
     transition: all 0.2s;
   }
 
@@ -542,6 +544,87 @@
 
   .confirm-btn:hover { background: var(--raa-yellow-hover); }
 
+  /* ── Polished tables (booking list & details) ── */
+  .summary-card.table-card { max-width: 580px; width: 100%; }
+  .table-card h3 .count { opacity: .5; font-weight: 400; font-size: 11px; margin-left: 4px; }
+
+  .rt-meta {
+    display: flex; flex-wrap: wrap; gap: 4px 18px;
+    font-size: 12px; margin-bottom: 4px; color: rgba(255,255,255,0.9);
+  }
+  .rt-meta .m b {
+    color: var(--raa-yellow); font-weight: 600; opacity: .85;
+    margin-right: 6px; font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px;
+  }
+
+  .rt-section {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: .8px;
+    color: var(--raa-yellow); opacity: .9; margin: 14px 0 4px; font-weight: 600;
+  }
+
+  .rt-scroll { overflow-x: auto; margin: 0 -2px; }
+  .rt-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .rt-table th {
+    text-align: left; font-weight: 600; font-size: 9.5px; text-transform: uppercase;
+    letter-spacing: .6px; color: rgba(255,255,255,0.5);
+    padding: 6px 9px; border-bottom: 1px solid rgba(255,255,255,0.2); white-space: nowrap;
+  }
+  .rt-table td {
+    padding: 7px 9px; border-bottom: 1px solid rgba(255,255,255,0.08);
+    color: rgba(255,255,255,0.92); vertical-align: top; line-height: 1.35;
+  }
+  .rt-table tbody tr:last-child td { border-bottom: none; }
+  .rt-table tbody tr:nth-child(even) td { background: rgba(255,255,255,0.03); }
+  .rt-table tbody tr:hover td { background: rgba(255,230,0,0.09); }
+  .rt-table td.num, .rt-table th.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .rt-table td.mono { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .rt-table .empty { color: rgba(255,255,255,0.4); font-style: italic; text-align: center; padding: 10px; }
+
+  .rt-booking-link {
+    background: none; border: none; padding: 0; cursor: pointer; font-family: inherit;
+    color: var(--raa-yellow); font-weight: 700; font-size: 12px;
+    border-bottom: 1px dashed rgba(255,230,0,0.5); transition: color .15s;
+  }
+  .rt-booking-link:hover { color: var(--raa-yellow-hover); border-bottom-style: solid; }
+
+  .rt-totals { margin-top: 12px; border-top: 1px solid rgba(255,255,255,0.2); padding-top: 8px; }
+  .rt-totals .rt-row { display: flex; justify-content: space-between; align-items: center; font-size: 12.5px; padding: 3px 0; }
+  .rt-totals .rt-row .k { color: rgba(255,255,255,0.7); }
+  .rt-totals .rt-row .v { font-variant-numeric: tabular-nums; }
+  .rt-totals .rt-row.grand { font-weight: 700; font-size: 14px; margin-top: 2px; }
+  .rt-totals .rt-row.grand .v { color: var(--raa-yellow); }
+
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 20px; font-size: 9.5px; font-weight: 700; letter-spacing: .4px; text-transform: uppercase; vertical-align: middle; margin-left: 6px; }
+  .badge.zero { background: rgba(40,202,66,0.18); color: #7CE38B; }
+  .badge.due  { background: rgba(255,230,0,0.16); color: var(--raa-yellow); }
+
+  /* ── PDF extraction / receipt card ── */
+  .pdf-card { max-width: 600px; width: 100%; }
+  .pdf-meta-row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; font-size: 12.5px; border-bottom: 1px solid rgba(255,255,255,0.1); }
+  .pdf-meta-row .k { color: rgba(255,255,255,0.6); }
+  .pdf-group { font-size: 10.5px; text-transform: uppercase; letter-spacing: .8px; color: var(--raa-yellow); opacity: .9; font-weight: 600; margin: 14px 0 6px; }
+  .pdf-item { background: rgba(255,255,255,0.035); border: 1px solid rgba(255,255,255,0.09); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+  .pdf-item-head { display: flex; align-items: center; gap: 8px; }
+  .pdf-type { font-size: 9.5px; font-weight: 700; letter-spacing: .5px; padding: 2px 7px; border-radius: 5px; background: rgba(255,230,0,0.16); color: var(--raa-yellow); white-space: nowrap; }
+  .pdf-type.cost { background: rgba(130,185,255,0.16); color: #8fbcff; }
+  .pdf-name { font-weight: 600; font-size: 13px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pdf-amt { font-weight: 700; font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .pdf-sub { font-size: 11.5px; color: rgba(255,255,255,0.55); margin-top: 4px; }
+  .pdf-cred { display: flex; align-items: center; gap: 9px; margin-top: 9px; }
+  .pdf-cred label { font-size: 10px; text-transform: uppercase; letter-spacing: .5px; color: rgba(255,255,255,0.55); white-space: nowrap; }
+  .pdf-input { flex: 1; background: rgba(0,0,0,0.28); border: 1px solid rgba(255,255,255,0.2); color: #fff; padding: 6px 9px; border-radius: 6px; font-family: inherit; font-size: 12.5px; min-width: 0; }
+  .pdf-input:focus { outline: none; border-color: var(--raa-yellow); }
+  .pdf-sfe { display: flex; align-items: center; gap: 7px; font-size: 12px; color: rgba(255,255,255,0.82); margin-top: 9px; }
+  .pdf-sfe input { width: 15px; height: 15px; accent-color: var(--raa-yellow); cursor: pointer; }
+  .pdf-sfe .hint { color: rgba(255,255,255,0.45); font-size: 11px; }
+  .pdf-eft { margin-top: 12px; border: 1px solid rgba(255,230,0,0.35); background: rgba(255,230,0,0.06); border-radius: 8px; padding: 10px 12px; }
+  .pdf-eft h4 { font-size: 10.5px; text-transform: uppercase; letter-spacing: .8px; color: var(--raa-yellow); margin-bottom: 6px; font-weight: 700; }
+  .pdf-eft .r { display: flex; justify-content: space-between; gap: 10px; font-size: 12.5px; padding: 2px 0; }
+  .pdf-eft .r .k { color: rgba(255,255,255,0.65); }
+  .pdf-eft .r .v { font-variant-numeric: tabular-nums; text-align: right; }
+  .pdf-eft .r.big .v { font-weight: 700; color: var(--raa-yellow); font-size: 15px; }
+  .pdf-warn { font-size: 11.5px; color: #e6b23c; margin-top: 9px; display: flex; gap: 6px; align-items: flex-start; }
+
   /* ── Footer ── */
   .footer {
     text-align: center;
@@ -594,7 +677,7 @@
     <div class="chat-container" id="chatContainer"></div>
     <div class="input-area">
       <input type="file" id="pdfInput" accept=".pdf">
-      <button class="upload-btn" onclick="document.getElementById('pdfInput').click()" title="Upload PDF">&#128206;</button>
+      <button class="upload-btn" onclick="document.getElementById('pdfInput').click()" title="Upload an RAA itinerary PDF">&#128206; Itinerary PDF</button>
       <input type="text" id="userInput" placeholder="Type a message..."
              onkeydown="if(event.key==='Enter' && !event.shiftKey) sendMessage()">
       <button class="send-btn" id="sendBtn" onclick="sendMessage()">&#10148;</button>
@@ -771,6 +854,12 @@
       case 'booking_state':
         showBookingState(data.state);
         break;
+      case 'pdf_extract':
+        showPdfExtract(data.filename, data.data);
+        break;
+      case 'pdf_receipt_preview':
+        showPdfReceiptPreview(data);
+        break;
       case 'pipeline_progress':
         updateTramadaProgress(data.percent, data.message);
         break;
@@ -816,6 +905,11 @@
   }
 
   function sendQuickReply(text) {
+    // A PDF-upload quick reply opens the file picker instead of sending text.
+    if (/upload.*pdf|itinerary pdf/i.test(text)) {
+      document.getElementById('pdfInput').click();
+      return;
+    }
     userInput.value = text;
     sendMessage();
   }
@@ -827,7 +921,8 @@
     reader.onload = () => {
       const base64 = reader.result.split(',')[1];
       addUserMessage(`&#128196; Uploaded: ${file.name}`);
-      ws.send(JSON.stringify({ type: 'pdf_upload', filename: file.name, data: base64 }));
+      // RAA itinerary/costing PDF → Tramada segments + costings + EFT receipt.
+      ws.send(JSON.stringify({ type: 'tramada_pdf_upload', stage: 'parse', filename: file.name, data: base64 }));
       showTypingIndicator();
     };
     reader.readAsDataURL(file);
@@ -959,57 +1054,219 @@
   const escHtml = (s) => String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/'/g, '&#39;').replace(/"/g, '&quot;');
 
+  // Decode HTML entities Tramada sometimes stores in text cells (e.g. "&#8594;" → "→").
+  const decodeEntities = (s) => String(s == null ? '' : s)
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch (e) { return ''; } })
+    .replace(/&#(\d+);/g, (_, d) => { try { return String.fromCodePoint(parseInt(d, 10)); } catch (e) { return ''; } })
+    .replace(/&rarr;/gi, '→').replace(/&nbsp;/gi, ' ').replace(/&amp;/g, '&');
+  // Tidy an itinerary string: decode entities, turn stray "?" (mis-rendered separators)
+  // into middots, collapse whitespace. Feed the result through escHtml before inserting.
+  const cleanItin = (s) => decodeEntities(s).replace(/\s*\?\s*/g, ' · ').replace(/\s+/g, ' ').trim();
+
   function showBookingList(bookings) {
-    const rows = (bookings || []).slice(0, 15).map((b) => `
-      <div class="summary-row">
-        <span class="label"><button class="quick-reply-btn" onclick="sendQuickReply('Open ${escHtml(b.bookingNo)}')">${escHtml(b.bookingNo)}</button></span>
-        <span>${escHtml(b.clientName)} &middot; ${escHtml(b.itinerary)} &middot; dep ${escHtml(b.depDate)}</span>
-      </div>`).join('') ||
-      '<div class="summary-row"><span class="label">No bookings found</span><span></span></div>';
+    const list = bookings || [];
+    const rows = list.slice(0, 25).map((b) => `
+      <tr>
+        <td><button class="rt-booking-link" onclick="sendQuickReply('Open ${escHtml(b.bookingNo)}')">${escHtml(b.bookingNo)}</button></td>
+        <td>${escHtml(b.clientName)}</td>
+        <td>${escHtml(cleanItin(b.itinerary))}</td>
+        <td class="mono">${escHtml(b.depDate)}</td>
+        <td class="mono">${escHtml(b.retDate)}</td>
+      </tr>`).join('');
+    const body = rows || '<tr><td class="empty" colspan="5">No bookings found</td></tr>';
     const wrapper = document.createElement('div');
     wrapper.className = 'message bot';
     wrapper.innerHTML = `
       <div class="avatar">R</div>
-      <div><div class="summary-card"><h3>&#128203; Bookings</h3>${rows}</div></div>`;
+      <div><div class="summary-card table-card">
+        <h3>&#128203; Bookings<span class="count">${list.length}</span></h3>
+        <div class="rt-scroll">
+          <table class="rt-table">
+            <thead><tr><th>Booking</th><th>Client</th><th>Itinerary</th><th>Dep</th><th>Ret</th></tr></thead>
+            <tbody>${body}</tbody>
+          </table>
+        </div>
+      </div></div>`;
     chatContainer.appendChild(wrapper);
     scrollToBottom();
   }
 
   function showBookingState(state) {
     const h = (state && state.header) || {};
-    const sec = (title) =>
-      `<div class="summary-row"><span class="label" style="font-weight:600;opacity:1">${title}</span><span></span></div>`;
-    const none = '<div class="summary-row"><span class="label" style="opacity:.5">none yet</span><span></span></div>';
+    const seg = state.segments || [];
+    const cost = state.costings || [];
+    const rcpt = state.receipts || [];
 
-    const segs = (state.segments || []).map((s) =>
-      `<div class="summary-row"><span class="label">${escHtml(s.segType)}</span><span>${escHtml(s.reference)}</span></div>`
-    ).join('') || none;
-    const costs = (state.costings || []).map((c) =>
-      `<div class="summary-row"><span class="label">${escHtml(c.segType)} ${escHtml(c.reference)}</span><span>${escHtml(c.dueIncGst)}</span></div>`
-    ).join('') || none;
-    const rcpts = (state.receipts || []).map((r) =>
-      `<div class="summary-row"><span class="label">${escHtml(r.receiptNo)} (${escHtml(r.transType)})</span><span>${escHtml(r.amount)} &middot; alloc ${escHtml(r.allocated)}</span></div>`
-    ).join('') || none;
+    const segBody = seg.map((s) =>
+      `<tr><td>${escHtml(s.segType)}</td><td>${escHtml(s.reference)}</td></tr>`
+    ).join('') || '<tr><td class="empty" colspan="2">none yet</td></tr>';
+
+    const costBody = cost.map((c) =>
+      `<tr><td>${escHtml(c.segType)}</td><td>${escHtml(c.reference)}</td><td class="num">${escHtml(c.dueIncGst)}</td></tr>`
+    ).join('') || '<tr><td class="empty" colspan="3">none yet</td></tr>';
+
+    const rcptBody = rcpt.map((r) =>
+      `<tr><td class="mono">${escHtml(r.receiptNo)}</td><td>${escHtml(r.transType)}</td><td class="num">${escHtml(r.amount)}</td><td class="num">${escHtml(r.allocated)}</td></tr>`
+    ).join('') || '<tr><td class="empty" colspan="4">none yet</td></tr>';
+
+    const balNum = parseFloat(String(h.balance || '').replace(/[^0-9.\-]/g, '')) || 0;
+    const balBadge = (h.balance != null && h.balance !== '')
+      ? (balNum === 0 ? '<span class="badge zero">Paid</span>' : '<span class="badge due">Due</span>')
+      : '';
 
     const wrapper = document.createElement('div');
     wrapper.className = 'message bot';
     wrapper.innerHTML = `
       <div class="avatar">R</div>
-      <div><div class="summary-card">
+      <div><div class="summary-card table-card">
         <h3>&#128196; Booking ${escHtml(state.bookingNo)}</h3>
-        <div class="summary-row"><span class="label">Client</span><span>${escHtml(h.clientName || h.client)}</span></div>
-        <div class="summary-row"><span class="label">Itinerary</span><span>${escHtml(h.itinerary)}</span></div>
-        <div class="summary-row"><span class="label">Departure</span><span>${escHtml(h.depDate)}</span></div>
-        ${sec('Segments')}${segs}
-        ${sec('Costing (due inc GST)')}${costs}
-        ${sec('Receipts')}${rcpts}
-        <div class="summary-row"><span class="label">Total due</span><span>${escHtml(h.totalDue)}</span></div>
-        <div class="summary-row"><span class="label">Receipted</span><span>${escHtml(h.receipted)}</span></div>
-        <div class="summary-row"><span class="label">Balance</span><span>${escHtml(h.balance)}</span></div>
+        <div class="rt-meta">
+          <span class="m"><b>Client</b>${escHtml(h.clientName || h.client)}</span>
+          <span class="m"><b>Itinerary</b>${escHtml(cleanItin(h.itinerary))}</span>
+          <span class="m"><b>Departure</b>${escHtml(h.depDate)}</span>
+        </div>
+
+        <div class="rt-section">Segments</div>
+        <div class="rt-scroll"><table class="rt-table">
+          <thead><tr><th>Type</th><th>Reference</th></tr></thead>
+          <tbody>${segBody}</tbody>
+        </table></div>
+
+        <div class="rt-section">Costing</div>
+        <div class="rt-scroll"><table class="rt-table">
+          <thead><tr><th>Type</th><th>Reference</th><th class="num">Due inc GST</th></tr></thead>
+          <tbody>${costBody}</tbody>
+        </table></div>
+
+        <div class="rt-section">Receipts</div>
+        <div class="rt-scroll"><table class="rt-table">
+          <thead><tr><th>Receipt No</th><th>Type</th><th class="num">Amount</th><th class="num">Allocated</th></tr></thead>
+          <tbody>${rcptBody}</tbody>
+        </table></div>
+
+        <div class="rt-totals">
+          <div class="rt-row"><span class="k">Total due</span><span class="v">${escHtml(h.totalDue)}</span></div>
+          <div class="rt-row"><span class="k">Receipted</span><span class="v">${escHtml(h.receipted)}</span></div>
+          <div class="rt-row grand"><span class="k">Balance${balBadge}</span><span class="v">${escHtml(h.balance)}</span></div>
+        </div>
       </div></div>`;
     chatContainer.appendChild(wrapper);
     scrollToBottom();
   }
+
+  // ── PDF upload: extraction card (editable creditors) → Create in Tramada ──
+  function showPdfExtract(filename, data) {
+    const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const fmt = (iso) => { const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})$/); return m ? `${+m[3]} ${MON[+m[2]-1]} ${m[1]}` : (iso || ''); };
+    const TYPE = { tour:'TOUR', hotel:'HOTEL', flight:'FLIGHT', insurance:'INS', servicefee:'FEE' };
+    const money2 = (v) => { const n = parseFloat(v); return isNaN(n) ? escHtml(String(v == null ? '' : v)) : n.toFixed(2); };
+    const cred = (kind, val) =>
+      `<div class="pdf-cred"><label>Creditor</label><input id="pdfCred_${kind}" class="pdf-input" type="text" value="${escHtml(val || '')}" placeholder="Tramada creditor name"></div>`;
+
+    const segItems = (data.segments || []).map((s) => {
+      const amt = s.amount != null ? s.amount : s.rate;
+      const a = fmt(s.startDate || s.checkInDate), b = fmt(s.finishDate || s.checkOutDate);
+      const dates = (a || b) ? `${a} → ${b}` : '';
+      return `<div class="pdf-item">
+        <div class="pdf-item-head"><span class="pdf-type">${escHtml(TYPE[s.kind] || String(s.kind).toUpperCase())}</span><span class="pdf-name">${escHtml(s.supplierName || '—')}</span><span class="pdf-amt">$${money2(amt)}</span></div>
+        <div class="pdf-sub">ref ${escHtml(s.reference || '—')}${dates ? ' &middot; ' + escHtml(dates) : ''}</div>
+        ${cred(s.kind, s.creditor || s.supplierName)}
+      </div>`;
+    }).join('');
+
+    const costItems = (data.costingLines || []).map((l) => {
+      if (l.kind === 'servicefee') {
+        return `<div class="pdf-item">
+          <div class="pdf-item-head"><span class="pdf-type cost">FEE</span><span class="pdf-name">${escHtml(l.description || 'Service Fee')}</span><span class="pdf-amt">$${money2(l.amount)}</span></div>
+          <div class="pdf-sfe"><input id="pdfInclSfe" type="checkbox"><span>Create this line</span><span class="hint">— usually skipped for EFT</span></div>
+          ${cred('servicefee', l.creditor || l.supplierName)}
+        </div>`;
+      }
+      return `<div class="pdf-item">
+        <div class="pdf-item-head"><span class="pdf-type cost">${escHtml(TYPE[l.kind] || String(l.kind).toUpperCase())}</span><span class="pdf-name">${escHtml(l.supplierName || '—')}</span><span class="pdf-amt">$${money2(l.amount)}</span></div>
+        ${cred(l.kind, l.creditor || l.supplierName)}
+      </div>`;
+    }).join('');
+
+    const warn = (data.warnings || []).map((w) => `<div class="pdf-warn"><span>&#9888;</span><span>${escHtml(w)}</span></div>`).join('');
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message bot';
+    wrapper.id = 'pdfExtractCard';
+    wrapper.innerHTML = `
+      <div class="avatar">R</div>
+      <div><div class="summary-card pdf-card">
+        <h3>&#128196; ${escHtml(filename || 'Itinerary PDF')}</h3>
+        <div class="pdf-meta-row"><span class="k">Booking</span><span>${escHtml(data.bookingNo)} &middot; BPAY ${escHtml(data.bpayRef || '—')}</span></div>
+        <div class="pdf-meta-row"><span class="k">Passengers</span><span>${escHtml((data.passengers || []).join(', '))}</span></div>
+        <div class="pdf-group">Segments</div>
+        ${segItems || '<div class="pdf-sub">none</div>'}
+        <div class="pdf-group">Costing lines</div>
+        ${costItems || '<div class="pdf-sub">none</div>'}
+        <div class="pdf-eft">
+          <h4>&#129534; EFT receipt</h4>
+          <div class="r big"><span class="k">Amount</span><span class="v">$${money2(data.receipt.amount)}</span></div>
+          <div class="r"><span class="k">Reference</span><span class="v">${escHtml(String(data.receipt.reference))} (BPAY)</span></div>
+          <div class="r"><span class="k">Allocate</span><span class="v">all segments</span></div>
+          <div class="r"><span class="k" style="opacity:.65">Staged first — you confirm before it's issued</span><span></span></div>
+        </div>
+        ${warn}
+        <button class="confirm-btn" onclick="submitPdfCreate()">&#9989; Create in Tramada</button>
+      </div></div>`;
+    chatContainer.appendChild(wrapper);
+    scrollToBottom();
+  }
+
+  window.submitPdfCreate = function () {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { addBotMessage('&#10060; Not connected to server.'); return; }
+    const creditors = {};
+    ['tour', 'hotel', 'insurance', 'servicefee'].forEach((k) => {
+      const el = document.getElementById('pdfCred_' + k);
+      if (el && el.value.trim()) creditors[k] = el.value.trim();
+    });
+    const sfe = document.getElementById('pdfInclSfe');
+    const includeServiceFee = !!(sfe && sfe.checked);
+    ws.send(JSON.stringify({ type: 'tramada_pdf_upload', stage: 'create', creditors, includeServiceFee }));
+    const card = document.getElementById('pdfExtractCard');
+    if (card) { card.removeAttribute('id'); card.querySelectorAll('input, button').forEach((el) => (el.disabled = true)); }
+    showTypingIndicator();
+  };
+
+  // ── PDF upload: staged EFT receipt preview → Issue ──
+  function showPdfReceiptPreview(payload) {
+    const r = (payload && payload.receipt) || {};
+    const res = (payload && payload.result) || {};
+    const staged = (res.receipt && res.receipt.staged) || {};
+    const amountRaw = r.amount != null ? r.amount : (staged.amount || '');
+    const amount = isNaN(parseFloat(amountRaw)) ? escHtml(String(amountRaw)) : parseFloat(amountRaw).toFixed(2);
+    const reference = r.reference || staged.reference || '';
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message bot';
+    wrapper.id = 'pdfReceiptCard';
+    wrapper.innerHTML = `
+      <div class="avatar">R</div>
+      <div><div class="summary-card pdf-card">
+        <h3>&#129534; EFT receipt — staged</h3>
+        <div class="pdf-sub" style="margin-bottom:2px">Segments &amp; costings are saved on booking ${escHtml(res.bookingNo || '')}. The receipt is filled in but <b>not issued</b> yet — review and confirm.</div>
+        <div class="pdf-eft">
+          <div class="r"><span class="k">Type</span><span class="v">EFT</span></div>
+          <div class="r big"><span class="k">Amount</span><span class="v">$${escHtml(String(amount))}</span></div>
+          <div class="r"><span class="k">Reference</span><span class="v">${escHtml(String(reference))}</span></div>
+          <div class="r"><span class="k">Allocate</span><span class="v">all segments</span></div>
+        </div>
+        <button class="confirm-btn" onclick="submitPdfIssue()">&#128179; Issue EFT receipt</button>
+      </div></div>`;
+    chatContainer.appendChild(wrapper);
+    scrollToBottom();
+  }
+
+  window.submitPdfIssue = function () {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { addBotMessage('&#10060; Not connected to server.'); return; }
+    ws.send(JSON.stringify({ type: 'tramada_pdf_upload', stage: 'issue' }));
+    const card = document.getElementById('pdfReceiptCard');
+    if (card) { card.removeAttribute('id'); card.querySelectorAll('input, button').forEach((el) => (el.disabled = true)); }
+    showTypingIndicator();
+  };
 
   function showTramadaPrompt(clientCode) {
     if (document.getElementById('tramadaPrompt')) return;  // don't double-render

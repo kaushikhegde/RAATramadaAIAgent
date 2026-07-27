@@ -616,6 +616,8 @@ async function runTramadaReceipt({
   bookingNo,
   receipt = {},
   dryRun = false,
+  skipIfNoAllocatable = false, // return {skipped:true} instead of throwing when
+                               // the receipt form has nothing to allocate
   callbacks = {},
 } = {}) {
   const onProgress = callbacks.onProgress || (() => {});
@@ -668,6 +670,14 @@ async function runTramadaReceipt({
     if (isCreditCard(txnCode) && !dryRun) {
       onProgress(60, "Entering new booking credit card...");
       await enterNewBookingCard(page, receipt.card);
+    }
+
+    // Nothing to allocate (booking already fully paid / no outstanding balance).
+    // With skipIfNoAllocatable, return a clean skip instead of throwing.
+    if ((!segments || segments.length === 0) && skipIfNoAllocatable) {
+      onProgress(100, `Nothing outstanding to allocate on booking ${bookingNo} — no receipt raised.`);
+      _ok = true;
+      return { details, itinerary: itin, segments: [], skipped: true, reason: "nothing to allocate", committed: false };
     }
 
     onProgress(70, "Allocating to segment(s)...");

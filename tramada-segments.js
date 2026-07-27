@@ -466,19 +466,26 @@ async function addHotelSegment(page, bookingNo, seg) {
   );
   await page.waitForSelector("#supplierName, #hotelName", { timeout: 15000 });
 
-  // Hotel Name (#supplierName) is a VALIDATED AUTOCOMPLETE of known suppliers
-  // (type "Holi" → [RTSYD51108] HOLIDAY INN ...). Pick from it when a listed
-  // supplier is given; otherwise use the free-form field (#hotelName) so a
-  // non-listed hotel still records a name.
+  // Hotel name. #supplierName is a VALIDATED AUTOCOMPLETE of KNOWN suppliers.
+  // Document names ("Novotel Bali Ngurah Rai Airport") usually AREN'T in that
+  // list (Tramada has "NOVOTEL BALI AIRPORT"), so: only try the autocomplete for
+  // an explicit listed supplier, and on no-match FALL BACK to the free-form name
+  // field (#hotelName) instead of hard-failing the whole run.
+  const hotelNameValue = seg.hotelName || seg.hotelNameFreeForm || seg.supplierName;
+  let pickedSupplier = false;
   if (seg.hotelSupplier) {
-    await pickAutocomplete(page, "#supplierName", seg.hotelSupplier);
-    // Picking a supplier fires an ajax that auto-fills the address block —
-    // let it finish re-rendering before touching the fields below it.
-    await sleep(1500);
+    try {
+      await pickAutocomplete(page, "#supplierName", seg.hotelSupplier);
+      await sleep(1500); // supplier ajax auto-fills the address block
+      pickedSupplier = true;
+    } catch { /* not a listed supplier → free-form below */ }
   }
-  await fillIf(page, "#hotelName", seg.hotelName || seg.hotelNameFreeForm); // free-form name
-  // City Code (#checkInLocation) is an autocomplete too.
-  await pickAutocomplete(page, "#checkInLocation", seg.cityCode);    // e.g. SYD
+  if (!pickedSupplier) {
+    await fillIf(page, "#hotelName", hotelNameValue);
+  }
+  // City Code (#checkInLocation) autocomplete — non-fatal (a doc city that
+  // doesn't match a Tramada city won't kill the save).
+  try { await pickAutocomplete(page, "#checkInLocation", seg.cityCode || seg.city); } catch { /* leave blank */ }
   await selectIf(page, "#roomTypeCode", seg.roomTypeCode);
   await fillIf(page, "#roomType", seg.roomType);           // free-form room type
   await setDateField(page, "#checkInDate", toTramadaDate(seg.checkInDate));
@@ -486,10 +493,13 @@ async function addHotelSegment(page, bookingNo, seg) {
   await selectIf(page, "#itinerarystatusTypeCode", seg.status || "HK");
 
   // Creditor (supplier being paid). Choose "Different from supplier" then set it.
+  // Non-fatal: if the name isn't a listed creditor, record it and carry on.
+  let creditorUnmatched = null;
   if (seg.creditor) {
     const diff = page.locator("#creditorDifferentRadio");
     if (await diff.count()) await diff.check().catch(() => {});
-    await pickAutocomplete(page, "#costingcreditor", seg.creditor);
+    try { await pickAutocomplete(page, "#costingcreditor", seg.creditor); }
+    catch { creditorUnmatched = seg.creditor; }
   }
 
   // Pricing (this is what makes the hotel receiptable). AUD rate incl GST is the
@@ -503,8 +513,8 @@ async function addHotelSegment(page, bookingNo, seg) {
 
   await sleep(400);
   await saveSegmentForm(page);
-  await assertSaved(page, `Hotel segment ${seg.hotelSupplier || seg.hotelName || ""}`);
-  return { type: "HTL", reference: seg.hotelName || seg.hotelSupplier || seg.creditor || "Hotel" };
+  await assertSaved(page, `Hotel segment ${hotelNameValue || ""}`.trim());
+  return { type: "HTL", reference: hotelNameValue || seg.creditor || "Hotel", creditorUnmatched };
 }
 
 /* ── Ticket costing (costs a flight so it becomes receiptable) ──────────── */
@@ -533,6 +543,134 @@ async function addTicketCosting(page, bookingNo, ticket) {
   await saveSegmentForm(page);
   await assertSaved(page, `Ticket costing ${ticket.airline || ""} ${ticket.class || ""}`.trim());
   return { type: "TKT", reference: `${ticket.airline || ""} ${ticket.class || ""}`.trim() };
+}
+
+/* ── PDF-pipeline segments/costings (Tour, Insurance, Service Fee) ───────────
+ *
+ * Field ids mapped live on booking 12752 (see pdf-field-map.md). Tramada's
+ * element id = the field NAME with dots removed (verified: costing.creditor →
+ * #costingcreditor, itinerary.statusTypeCode → #itinerarystatusTypeCode). NOTE
+ * the Tour form uses audRate**Incl**Gst (with an "l"), unlike the Hotel form's
+ * audRateIncGst — the ids below are the exact verified names, not guesses.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+// Try to match a creditor autocomplete. Returns null on success, or the
+// UNMATCHED value so the caller can report it. The run CONTINUES instead of
+// hard-failing on a name that isn't a listed Tramada creditor (doc names like
+// "Tour East Bali" / "Novotel Bali Ngurah Rai Airport" usually aren't).
+async function pickCreditor(page, selector, value) {
+  if (!value) return null;
+  try { await pickAutocomplete(page, selector, value); return null; }
+  catch { return value; }
+}
+
+/* ── Tour segment (itinerary) ──────────────────────────────────────────── */
+
+async function addTourSegment(page, bookingNo, seg) {
+  await page.goto(
+    `${TRAMADA_BASE_URL}/booking/booking-tour-segment.htm?mode=add&pageSourceParam=itinerariesPage&parentId=${encodeURIComponent(bookingNo)}`,
+    { waitUntil: "domcontentloaded" }
+  );
+  await page.waitForSelector("#tourCompanyName, #costingcreditor", { timeout: 15000 });
+
+  // Tour company FREE-FORM name (the product, e.g. "Tour East Bali").
+  await fillIf(page, "#tourCompanyName", seg.supplierName || seg.tourCompany);
+
+  // Creditor (who Tramada pays). Prefer an explicit override; else try the doc's
+  // supplier name. Choose "Different from supplier" so the field is editable.
+  // Non-fatal: an unmatched creditor is recorded, not thrown.
+  let creditorUnmatched = null;
+  const creditor = seg.creditor || seg.supplierName;
+  if (creditor) {
+    const diff = page.locator('[name="creditorSameOrDifferentFromSupplier"][value="DIFFERENT"]');
+    if (await diff.count()) await diff.first().check().catch(() => {});
+    creditorUnmatched = await pickCreditor(page, "#costingcreditor", creditor);
+  }
+
+  await fillIf(page, "#freeTextDescription", seg.description);
+  if (seg.city) {
+    // City autocompletes are non-fatal (a doc city that doesn't match won't kill the save).
+    try { await pickAutocomplete(page, "#departureCity", seg.city); } catch { /* skip */ }
+    try { await pickAutocomplete(page, "#finishCity", seg.city); } catch { /* skip */ }
+  }
+  await setDateField(page, "#startDate", toTramadaDate(seg.startDate));
+  await setDateField(page, "#finishDate", toTramadaDate(seg.finishDate || seg.startDate));
+  await setDateField(page, "#itineraryconfirmationOrIssueDate", toTramadaDate(seg.startDate));
+  await fillIf(page, "#itineraryconfirmationOrReferenceNumber", seg.reference);
+  await fillIf(page, "#costingcreditorInvoiceNumber", seg.reference);
+  await selectIf(page, "#itinerarystatusTypeCode", seg.status || "HK");
+
+  // Amount: put the line TOTAL in the rate with passengers=1 / duration=1 so
+  // Tramada's computed total equals the doc's tour total exactly (no surprise
+  // rate × pax × days multiplication).
+  await setMoneyField(page, "#localRateInclGst", seg.amount);
+  await setMoneyField(page, "#audRateInclGst", seg.amount);
+  await fillIf(page, "#numberOfPassengers", seg.passengers || 1);
+  await selectIf(page, "#durationTypeCode", seg.durationType || "Days");
+  await fillIf(page, "#duration", seg.duration || 1);
+
+  await sleep(400);
+  await saveSegmentForm(page);
+  await assertSaved(page, `Tour segment ${seg.supplierName || ""}`.trim());
+  return { type: "TUR", reference: seg.reference || seg.supplierName || "Tour", creditorUnmatched };
+}
+
+/* ── Insurance costing line ────────────────────────────────────────────── */
+
+async function addInsuranceCosting(page, bookingNo, ins) {
+  await page.goto(
+    `${TRAMADA_BASE_URL}/booking/booking-insurance-segment.htm?mode=add&pageSourceParam=costingsPage&parentId=${encodeURIComponent(bookingNo)}`,
+    { waitUntil: "domcontentloaded" }
+  );
+  await page.waitForSelector("#costingcreditor", { timeout: 15000 });
+
+  const creditor = ins.creditor || ins.supplierName; // e.g. "Tokio Marine" (IS on the doc)
+  const creditorUnmatched = creditor ? await pickCreditor(page, "#costingcreditor", creditor) : null;
+  await setDateField(page, "#startDate", toTramadaDate(ins.startDate));
+  await setDateField(page, "#endDate", toTramadaDate(ins.endDate));
+  await selectIf(page, "#statusTypeCode", ins.status || "Confirmed");
+  await setDateField(page, "#confirmationOrIssueDate", toTramadaDate(ins.issueDate));
+  await fillIf(page, "#confirmationOrReferenceNumber", ins.reference); // policy no (if any)
+  await fillIf(page, "#costingcreditorInvoiceNumber", ins.reference);
+
+  // Primary amount (incl GST). Insurance here is GST-free so excl auto-mirrors it.
+  await setMoneyField(page, "#policyGrossAmountInclGst", ins.amount);
+
+  await sleep(400);
+  await saveSegmentForm(page);
+  await assertSaved(page, `Insurance line ${ins.supplierName || ins.creditor || ""}`.trim());
+  return { type: "INS", reference: ins.reference || ins.supplierName || "Insurance", creditorUnmatched };
+}
+
+/* ── Service Fee costing line (OPTIONAL) ────────────────────────────────────
+ * Under an EFT receipt there is normally no credit-card surcharge, so the PDF
+ * pipeline SKIPS this by default. When enabled, the fee-TYPE code (e.g.
+ * A_CS_SFE_FEE) is normally chosen via a "Select Fee Type" lookup on the form —
+ * that lookup is NOT yet automated here; we set the visible fields and rely on a
+ * default/typed fee type. If a run needs a specific fee type, map that lookup
+ * live first. Kept best-effort so the main EFT path never depends on it.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+async function addServiceFeeCosting(page, bookingNo, fee) {
+  await page.goto(
+    `${TRAMADA_BASE_URL}/booking/booking-service-fee-segment.htm?mode=add&pageSourceParam=costingsPage&parentId=${encodeURIComponent(bookingNo)}`,
+    { waitUntil: "domcontentloaded" }
+  );
+  await page.waitForSelector("#description, #costingcreditor", { timeout: 15000 });
+
+  await selectIf(page, "#serviceFeeType", fee.serviceFeeType || "Booking Fee");
+  if (fee.feeType) await fillIf(page, "#feeType", fee.feeType);
+  await fillIf(page, "#description", fee.description || "Service Fee");
+  const creditor = fee.creditor || fee.supplierName;
+  const creditorUnmatched = creditor ? await pickCreditor(page, "#costingcreditor", creditor) : null;
+  await fillIf(page, "#quantity", fee.quantity || 1);
+  await setMoneyField(page, "#grossFeeAmountInclGst", fee.amount);
+  await fillIf(page, "#issueDate", toTramadaDate(fee.issueDate));
+
+  await sleep(400);
+  await saveSegmentForm(page);
+  await assertSaved(page, `Service fee ${fee.description || ""}`.trim());
+  return { type: "SFE", reference: fee.description || "Service Fee", creditorUnmatched };
 }
 
 // Read the costing table so callers can confirm what's receiptable.
@@ -749,6 +887,7 @@ async function runAddSegments({ username, password, bookingNo, segments = [], ca
       onProgress(20 + i * 10, `Adding ${s.kind} segment ${i + 1}/${segments.length}...`);
       if (s.kind === "flight") added.push(await addFlightSegment(page, bookingNo, s));
       else if (s.kind === "hotel") added.push(await addHotelSegment(page, bookingNo, s));
+      else if (s.kind === "tour") added.push(await addTourSegment(page, bookingNo, s));
       else throw new Error(`Unknown segment kind: ${s.kind}`);
     }
     onProgress(100, `Added ${added.length} segment(s).`);
@@ -772,6 +911,27 @@ async function runAddCostings({ username, password, bookingNo, costings = [], ca
     const costingTable = await readCostings(page, bookingNo);
     onProgress(100, `Costed ${done.length} ticket(s).`);
     return { done, costingTable };
+  });
+}
+
+/**
+ * Add standalone costing LINES (insurance, service fee) — the ones added on the
+ * Costing page rather than the itinerary. Each: { kind:"insurance"|"servicefee", ... }.
+ */
+async function runAddCostingLines({ username, password, bookingNo, lines = [], callbacks = {} }) {
+  const onProgress = callbacks.onProgress || (() => {});
+  if (!bookingNo) throw new Error("bookingNo required");
+  return await withPage({ username, password, callbacks }, async (page) => {
+    const added = [];
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i];
+      onProgress(20 + i * 10, `Adding ${l.kind} costing ${i + 1}/${lines.length}...`);
+      if (l.kind === "insurance") added.push(await addInsuranceCosting(page, bookingNo, l));
+      else if (l.kind === "servicefee") added.push(await addServiceFeeCosting(page, bookingNo, l));
+      else throw new Error(`Unknown costing line kind: ${l.kind}`);
+    }
+    onProgress(100, `Added ${added.length} costing line(s).`);
+    return added;
   });
 }
 
@@ -915,19 +1075,209 @@ async function runFullBooking({
   }
 }
 
+/**
+ * PDF-driven pipeline: given the structured data parsed from an RAA itinerary/
+ * costing PDF, add its Tour + Hotel segments and Insurance (and optionally
+ * Service Fee) costing lines to the EXISTING booking (resolved from the BPAY
+ * Ref), then stage/issue an EFT receipt for the full amount.
+ *
+ * Safe by design:
+ *  - Verifies the booking exists and the client matches the PDF; STOPS on
+ *    mismatch without changing anything.
+ *  - Idempotent: skips any Tour/Hotel/Insurance/Service-Fee that is already on
+ *    the booking, and skips the receipt if the booking is already fully paid.
+ *  - dryRunReceipt defaults TRUE — the receipt is staged (screenshot) but not
+ *    committed, so the caller can confirm before issuing (req: confirm first).
+ *
+ * @param {object} args
+ * @param {object} args.data                parsed PDF (see pdf-itinerary.js)
+ * @param {boolean}[args.includeServiceFee=false]  create the Service-Fee line too
+ * @param {boolean}[args.dryRunReceipt=true]       stage (don't commit) the receipt
+ * @param {object} [args.callbacks]         { onProgress, onError, onStage, onNeedLogin }
+ */
+async function runPdfBooking({
+  username,
+  password,
+  data,
+  includeServiceFee = false,
+  dryRunReceipt = true,
+  callbacks = {},
+} = {}) {
+  const onProgress = callbacks.onProgress || (() => {});
+  const onError = callbacks.onError || (() => {});
+  const onStage = callbacks.onStage || (() => {});
+  const onNeedLogin = callbacks.onNeedLogin;
+
+  const bookingNo = data && data.bookingNo;
+  if (!bookingNo) throw new Error("No booking number in the parsed PDF (BPAY Ref missing?).");
+
+  try {
+    // 1) Verify the booking exists AND the client matches the PDF.
+    onProgress(5, `Opening booking ${bookingNo}...`);
+    const state = await withPage({ username, password, callbacks: { onNeedLogin } }, async (page) => {
+      const header = await readBookingHeader(page, bookingNo);
+      const segments = await readItinerary(page, bookingNo);
+      const costings = await readCostings(page, bookingNo);
+      const receipts = await readReceiptsList(page, bookingNo);
+      return { header, segments, costings, receipts };
+    });
+    const { header, segments: existingSegs, costings: existingCosts, receipts } = state;
+
+    if (!header || !header.bookingNo) {
+      throw new Error(`Booking ${bookingNo} could not be opened in Tramada — check the BPAY Ref.`);
+    }
+    // Match on the full SURNAME/FIRSTNAME key, not just surname — several GRAY
+    // family members exist, so surname-only would wrongly pass GRAY/SPIDER for a
+    // GRAY/MEGAN PDF. Strip titles (MR/MS/DR…) and non-name chars first.
+    const nameKey = (s) => String(s || "").toUpperCase()
+      .replace(/\b(MR|MRS|MS|DR|MISS|MSTR|MASTER|PROF)\b/g, "")
+      .replace(/[^A-Z/]/g, "").trim();
+    const paxKeys = (data.passengers || []).map(nameKey).filter(Boolean);
+    const hdrKey = nameKey(header.client);
+    let clientOk;
+    if (hdrKey.includes("/")) {
+      clientOk = !paxKeys.length || paxKeys.some((k) => k === hdrKey || k.includes(hdrKey) || hdrKey.includes(k));
+    } else {
+      // No slash-format client on the header — fall back to surname match.
+      const surnames = paxKeys.map((k) => k.split("/")[0]).filter(Boolean);
+      const hay = `${header.client || ""} ${header.clientName || ""}`.toUpperCase().replace(/[^A-Z]/g, "");
+      clientOk = !surnames.length || surnames.some((s) => hay.includes(s));
+    }
+    onStage("verify", { bookingNo, header, clientOk, paxKeys, hdrKey });
+    if (!clientOk) {
+      throw new Error(
+        `Client mismatch — booking ${bookingNo} is "${(header.client || header.clientName || "").trim()}" ` +
+          `but the PDF is for ${(data.passengers || []).join(", ")}. Stopping; nothing changed. ` +
+          `(This PDF belongs to booking ${data.bookingNo}.)`
+      );
+    }
+
+    // 2) Segments — add Tour/Hotel not already present (idempotent).
+    const haveTUR = existingSegs.some((s) => /TUR/i.test(s.segType));
+    const haveHTL = existingSegs.some((s) => /HTL/i.test(s.segType));
+    const segsToAdd = (data.segments || []).filter(
+      (s) => (s.kind === "tour" && !haveTUR) || (s.kind === "hotel" && !haveHTL)
+    );
+    let segResult = [];
+    if (segsToAdd.length) {
+      onProgress(30, `Adding ${segsToAdd.length} itinerary segment(s)...`);
+      segResult = await runAddSegments({
+        username, password, bookingNo, segments: segsToAdd,
+        callbacks: { onNeedLogin, onProgress: (p, m) => onProgress(30 + Math.round(p * 0.25), m) },
+      });
+    } else {
+      onProgress(30, "Tour/Hotel segments already present — skipping.");
+    }
+    onStage("segments", { added: segResult, skipped: { tour: haveTUR, hotel: haveHTL } });
+
+    // 3) Costing lines — Insurance always; Service Fee only if asked (EFT
+    //    normally has no card surcharge).
+    const haveINS = existingCosts.some((c) => /INS/i.test(c.segType));
+    const haveSFE = existingCosts.some((c) => /SFE/i.test(c.segType));
+    const linesToAdd = (data.costingLines || []).filter((l) => {
+      if (l.kind === "insurance") return !haveINS;
+      if (l.kind === "servicefee") return includeServiceFee && !haveSFE;
+      return false;
+    });
+    let costResult = [];
+    if (linesToAdd.length) {
+      onProgress(58, `Adding ${linesToAdd.length} costing line(s)...`);
+      costResult = await runAddCostingLines({
+        username, password, bookingNo, lines: linesToAdd,
+        callbacks: { onNeedLogin, onProgress: (p, m) => onProgress(58 + Math.round(p * 0.17), m) },
+      });
+    } else {
+      onProgress(58, "Costing lines already present — skipping.");
+    }
+    onStage("costingLines", { added: costResult, skipped: { insurance: haveINS, servicefee: haveSFE } });
+
+    // 4) EFT receipt — but ONLY if the booking has an outstanding balance. A
+    //    fully-paid booking (12752 etc.) has NOTHING to allocate on the receipt
+    //    form, so attempting one throws "No costed segments to allocate". This
+    //    must be skipped for BOTH the dry-run stage and a real commit.
+    const balance = parseFloat(String(header.balance || "").replace(/[^0-9.\-]/g, "") || "0");
+    const alreadyReceipted = balance <= 0.005 && (receipts || []).length > 0;
+    const addedAnything = (segResult.length + costResult.length) > 0;
+    // If we didn't add anything new, the balance we read up front is current;
+    // nothing outstanding → no receipt to raise.
+    const skipReceipt = !addedAnything && balance <= 0.005;
+
+    let receiptResult = null;
+    let receiptSkipped = false;
+    let receiptSkipReason = null;
+    if (skipReceipt) {
+      receiptSkipped = true;
+      receiptSkipReason = alreadyReceipted ? "already receipted" : "nothing outstanding";
+      onProgress(100, `Booking ${bookingNo} has no outstanding balance (${balance.toFixed(2)}) — no EFT receipt to raise.`);
+      onStage("receipt", { skipped: true, reason: receiptSkipReason, receipts });
+    } else if (data.receipt) {
+      onProgress(78, dryRunReceipt ? "Staging EFT receipt (not committed)..." : "Issuing EFT receipt...");
+      try {
+        receiptResult = await runTramadaReceipt({
+          username, password, bookingNo,
+          receipt: { ...data.receipt, transactionType: "EFT" },
+          dryRun: dryRunReceipt,
+          skipIfNoAllocatable: true, // fully-paid booking → clean skip, not a throw
+          callbacks: { onNeedLogin, onProgress: (p, m) => onProgress(78 + Math.round(p * 0.2), m) },
+        });
+        if (receiptResult && receiptResult.skipped) {
+          receiptSkipped = true;
+          receiptSkipReason = receiptResult.reason || "nothing to allocate";
+          receiptResult = null;
+          onStage("receipt", { skipped: true, reason: receiptSkipReason });
+        } else {
+          onStage("receipt", receiptResult);
+        }
+      } catch (e) {
+        // Safety net: an empty allocation table means nothing is outstanding —
+        // treat as a clean skip rather than a hard failure.
+        if (/no costed segments to allocate|nothing to allocate/i.test(e.message || "")) {
+          receiptSkipped = true;
+          receiptSkipReason = "nothing outstanding to allocate";
+          onProgress(100, `Nothing outstanding to allocate on booking ${bookingNo} — skipping EFT receipt.`);
+          onStage("receipt", { skipped: true, reason: receiptSkipReason });
+        } else {
+          throw e;
+        }
+      }
+    }
+
+    const nothingToDo = !addedAnything && receiptSkipped;
+    const unmatchedCreditors = [...(segResult || []), ...(costResult || [])]
+      .map((r) => r && r.creditorUnmatched).filter(Boolean);
+    onProgress(100, dryRunReceipt ? "Ready — EFT receipt staged (confirm to issue)." : "PDF booking complete.");
+    return {
+      bookingNo, header,
+      segments: segResult, costingLines: costResult, receipt: receiptResult,
+      alreadyReceipted, receiptSkipped, receiptSkipReason, nothingToDo, balance,
+      unmatchedCreditors,
+    };
+  } catch (err) {
+    onError(err.message);
+    throw err;
+  }
+}
+
 module.exports = {
   runFullBooking,
+  runPdfBooking,
   runReadBookingState,
   runAddPassenger,
   runAddSegments,
   runAddCostings,
+  runAddCostingLines,
   // page-level (for composing on a shared page / testing)
   addPassenger,
   addFlightSegment,
   addHotelSegment,
+  addTourSegment,
   addTicketCosting,
+  addInsuranceCosting,
+  addServiceFeeCosting,
   readCostings,
   readItinerary,
+  readBookingHeader,
+  readReceiptsList,
   toTramadaDate,
   toFlightNumber,
   toClassCode,

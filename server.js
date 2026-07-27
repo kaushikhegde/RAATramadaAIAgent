@@ -25,7 +25,8 @@ const { buildSystemPrompt, buildAssistantPrompt } = require("./geminiPrompt");
 const { runTramadaAutomation } = require("./tramada-automator");
 const { runTramadaAddAndSearch } = require("./tramada-booking");
 const { runTramadaReceipt, searchBookingsForReceipt } = require("./tramada-receipt");
-const { runFullBooking, runReadBookingState } = require("./tramada-segments");
+const { runFullBooking, runReadBookingState, runPdfBooking } = require("./tramada-segments");
+const { parseRaaItineraryBuffer } = require("./pdf-itinerary");
 
 // ─── Config ──────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -100,8 +101,8 @@ wss.on("connection", (ws) => {
   if (PIPELINE_MODE) {
     sendToClient(ws, {
       type: "bot_message",
-      text: "Hi — I can create a new booking in Tramada, or open an existing one to add segments, costings or receipts. What would you like to do?",
-      quickReplies: ["Create new booking", "Browse existing bookings"],
+      text: "Hi — I can create a new booking in Tramada, open an existing one to add segments, costings or receipts, or take an RAA itinerary PDF and build it out for you (segments, costings and the EFT receipt). Pick an option below, or use the 📎 button to upload a PDF.",
+      quickReplies: ["Create new booking", "Browse existing bookings", "📎 Upload itinerary PDF"],
     });
   } else {
     sendToClient(ws, {
@@ -165,6 +166,13 @@ async function handleClientMessage(session, msg) {
       await handlePdfUpload(session, msg.filename, msg.data);
       break;
 
+    // RAA itinerary/costing PDF → Tramada segments + costings + EFT receipt.
+    // stage: "parse" (extract & show card) → "create" (add segments/costings +
+    // stage receipt) → "issue" (commit the EFT receipt). Confirm before issue.
+    case "tramada_pdf_upload":
+      await handleTramadaPdfUpload(session, msg);
+      break;
+
     case "tramada_search":
       await handleTramadaSearch(session, msg.username, msg.password);
       break;
@@ -222,6 +230,14 @@ async function handleUserMessage(session, userText) {
       sendToClient(ws, { type: "bot_message", text: "No worries — cancelled. Tell me what to change." });
       return;
     }
+
+    // "use / apply the same PDF for booking 12806" — apply the last uploaded PDF
+    // to a different booking (the client-match guard keeps it safe).
+    if (session.lastPdf && /\bpdf\b/i.test(userText) && /\b(use|apply|run|create|add|do|same|for)\b/i.test(userText)) {
+      const bkgM = userText.match(/(?:booking\s*(?:no\.?\s*)?|for\s+|to\s+|on\s+|#)(\d{4,6})\b/i) ||
+        userText.match(/\b(\d{4,6})\s+booking\b/i);
+      if (bkgM) { await runPdfForBooking(session, bkgM[1]); return; }
+    }
   }
 
   // Check if user confirmed booking
@@ -263,8 +279,22 @@ async function handleUserMessage(session, userText) {
       session.geminiChat = getGeminiChat();
     }
 
-    // Send user message to Gemini
-    const result = await session.geminiChat.sendMessage(userText);
+    // Send user message to Gemini. If a PDF was uploaded this session, prepend
+    // its context so follow-up questions ("what's in the PDF", "use it for X")
+    // are understood instead of getting a blank greeting.
+    let toSend = userText;
+    if (PIPELINE_MODE && session.lastPdf) {
+      const p = session.lastPdf;
+      const segs = (p.segments || []).map((s) => `${s.kind} ${s.supplierName || ""}`.trim()).join("; ");
+      const costs = (p.costingLines || []).map((c) => `${c.kind} ${c.supplierName || c.description || ""}`.trim()).join("; ");
+      toSend =
+        `[CONTEXT] The user uploaded an RAA itinerary PDF for booking ${p.bookingNo} ` +
+        `(passengers: ${(p.passengers || []).join(", ")}), EFT total $${p.receipt && p.receipt.amount}, ` +
+        `BPAY ref ${p.receipt && p.receipt.reference}. Segments: ${segs || "none"}. Costing lines: ${costs || "none"}. ` +
+        `Applying this PDF to a DIFFERENT booking number is supported (it reuses these segments/costings there, with a ` +
+        `client-name safety check). Use this context to answer; do not greet the user again.\n\n[USER] ${userText}`;
+    }
+    const result = await session.geminiChat.sendMessage(toSend);
     const response = result.response.text();
 
     // Assistant mode: handle intents (list_bookings / open_booking / run) with
@@ -452,6 +482,208 @@ async function handlePdfUpload(session, filename, base64Data) {
       type: "error",
       text: `Couldn't read that PDF: ${err.message}. Try telling me your booking details instead!`,
     });
+  }
+}
+
+// ─── Handle RAA itinerary PDF → Tramada (segments + costings + EFT receipt) ──
+// Apply user-supplied creditor overrides (by segment/line kind) to the parsed data.
+function applyPdfCreditors(data, creditors) {
+  if (!creditors) return;
+  for (const s of data.segments || []) if (creditors[s.kind]) s.creditor = creditors[s.kind];
+  for (const l of data.costingLines || []) if (creditors[l.kind]) l.creditor = creditors[l.kind];
+}
+
+function pdfPipelineCallbacks(session) {
+  const { ws } = session;
+  return {
+    onProgress: (pct, m) => session.active && sendToClient(ws, { type: "pipeline_progress", percent: pct, message: m }),
+    onStage: (name, d) => session.active && sendToClient(ws, { type: "pipeline_stage", stage: name, data: d }),
+    onError: (m) => session.active && sendToClient(ws, { type: "error", text: `Tramada: ${m}` }),
+    onNeedLogin: () =>
+      session.active &&
+      sendToClient(ws, {
+        type: "bot_message",
+        text: "🔐 Sign into Tramada in the Chrome window on port 9222 (from `npm run start:chrome`) — I'll detect it and continue.",
+      }),
+  };
+}
+
+async function handleTramadaPdfUpload(session, msg) {
+  const { ws } = session;
+  const stage = msg.stage || "parse";
+
+  try {
+    // Step 1 — parse the uploaded PDF and show the extraction card.
+    if (stage === "parse") {
+      sendToClient(ws, { type: "typing" });
+      const buf = Buffer.from(msg.data, "base64");
+      const data = await parseRaaItineraryBuffer(buf);
+      if (!data.bookingNo) {
+        sendToClient(ws, {
+          type: "error",
+          text: "Couldn't find a booking number (BPAY Ref) in that PDF. Is it an RAA itinerary/costing confirmation?",
+        });
+        return;
+      }
+      session.pendingPdf = { data, filename: msg.filename };
+      session.lastPdf = data; // persist for follow-up questions ("use this PDF for booking N")
+      sendToClient(ws, { type: "pdf_extract", filename: msg.filename, data });
+      const warn = (data.warnings || []).length ? ` (⚠ ${data.warnings.length} warning(s) — see card)` : "";
+      sendToClient(ws, {
+        type: "bot_message",
+        text:
+          `📄 Read "${msg.filename}". Booking ${data.bookingNo}, EFT total $${data.receipt.amount}${warn}. ` +
+          `Check the details and creditors on the card, then hit “Create in Tramada”.`,
+      });
+      return;
+    }
+
+    // Steps 2 & 3 need the staged parse.
+    if (!session.pendingPdf) {
+      sendToClient(ws, { type: "error", text: "Upload the itinerary PDF again — I don't have it staged." });
+      return;
+    }
+    const data = session.pendingPdf.data;
+    applyPdfCreditors(data, msg.creditors);
+    const includeServiceFee = !!msg.includeServiceFee;
+
+    // Step 2 — create segments + costings, STAGE (don't commit) the EFT receipt.
+    if (stage === "create") {
+      sendToClient(ws, { type: "bot_message", text: "On it — adding segments and costings, and staging the EFT receipt. Progress below." });
+      const result = await runPdfBooking({
+        username: process.env.TRAMADA_USERNAME,
+        password: process.env.TRAMADA_PASSWORD,
+        data,
+        includeServiceFee,
+        dryRunReceipt: true, // stage only — confirm before issue
+        callbacks: pdfPipelineCallbacks(session),
+      });
+      session.currentBookingNo = result.bookingNo;
+      const nSeg = result.segments.length, nCost = result.costingLines.length;
+
+      if (result.unmatchedCreditors && result.unmatchedCreditors.length) {
+        sendToClient(ws, {
+          type: "bot_message",
+          text: `⚠️ These creditor names from the doc didn't match a Tramada creditor, so I saved the line(s) without a creditor — set them in Tramada (or re-run with the right creditor): ${[...new Set(result.unmatchedCreditors)].join(", ")}.`,
+        });
+      }
+
+      // Fully-paid / nothing-outstanding booking → no receipt to stage. Report
+      // it plainly instead of showing an empty receipt card.
+      if (result.receiptSkipped) {
+        session.pendingPdfIssue = null;
+        session.pendingPdf = null;
+        const did = [nSeg ? `added ${nSeg} segment(s)` : "", nCost ? `added ${nCost} costing line(s)` : ""].filter(Boolean).join(" and ");
+        sendToClient(ws, {
+          type: "bot_message",
+          text: result.nothingToDo
+            ? `Booking ${result.bookingNo} already has everything — all segments and costings are present and it's fully receipted (balance ${Number(result.balance).toFixed(2)}). Nothing to do. ✅`
+            : `${did ? did.charAt(0).toUpperCase() + did.slice(1) + " on" : "Booking"} ${result.bookingNo}. It has no outstanding balance (${Number(result.balance).toFixed(2)}), so there's no EFT receipt to raise. Done. ✅`,
+        });
+        return;
+      }
+
+      session.pendingPdfIssue = { includeServiceFee };
+      sendToClient(ws, { type: "pdf_receipt_preview", result, receipt: data.receipt });
+      sendToClient(ws, {
+        type: "bot_message",
+        text:
+          `Segments and costings are in for booking ${result.bookingNo}. The EFT receipt for ` +
+          `$${data.receipt.amount} (ref ${data.receipt.reference}, allocate all) is staged but NOT issued. ` +
+          `Hit “Issue EFT receipt” to commit it.`,
+      });
+      return;
+    }
+
+    // Step 3 — issue the EFT receipt. runPdfBooking is idempotent: it skips the
+    // segments/costings created in step 2 and just issues the receipt.
+    if (stage === "issue") {
+      sendToClient(ws, { type: "bot_message", text: "Issuing the EFT receipt now…" });
+      const result = await runPdfBooking({
+        username: process.env.TRAMADA_USERNAME,
+        password: process.env.TRAMADA_PASSWORD,
+        data,
+        includeServiceFee: (session.pendingPdfIssue && session.pendingPdfIssue.includeServiceFee) || includeServiceFee,
+        dryRunReceipt: false, // commit
+        callbacks: pdfPipelineCallbacks(session),
+      });
+      session.currentBookingNo = result.bookingNo;
+      session.pendingPdf = null;
+      session.pendingPdfIssue = null;
+      sendToClient(ws, { type: "pipeline_complete", result });
+      const rc = result.receipt && result.receipt.receipt;
+      sendToClient(ws, {
+        type: "bot_message",
+        text: rc
+          ? `✅ Done — booking ${result.bookingNo}, EFT receipt ${rc.receiptNo} for ${rc.amount} (allocated ${rc.allocated}).`
+          : result.receiptSkipped
+          ? `✅ Booking ${result.bookingNo} is up to date — no EFT receipt was needed (${result.receiptSkipReason}).`
+          : `✅ Done — booking ${result.bookingNo} updated.`,
+      });
+      return;
+    }
+
+    sendToClient(ws, { type: "error", text: `Unknown PDF stage "${stage}".` });
+  } catch (err) {
+    console.error("Tramada PDF error:", err.message);
+    const needsLogin = /not logged in|log into tramada|login/i.test(err.message);
+    sendToClient(ws, { type: "error", text: `PDF run failed: ${err.message}` });
+    sendToClient(ws, {
+      type: "bot_message",
+      text: needsLogin
+        ? "Sign into Tramada in the port-9222 Chrome window, then hit the button again — it resumes and skips whatever already saved."
+        : "A re-run is safe — it skips anything already created. Fix the issue above (e.g. a creditor that didn't match) and try again.",
+    });
+  }
+}
+
+// Apply the last-uploaded PDF to a DIFFERENT booking number (from a chat
+// follow-up like "use the same PDF for 12806"). runPdfBooking's client-match
+// guard stops safely if that booking belongs to a different client.
+async function runPdfForBooking(session, targetBooking) {
+  const { ws } = session;
+  const src = session.lastPdf;
+  if (!src) {
+    sendToClient(ws, { type: "bot_message", text: "I don't have a PDF staged — upload one first." });
+    return;
+  }
+  const data = { ...src, bookingNo: String(targetBooking), receipt: { ...src.receipt } };
+  sendToClient(ws, {
+    type: "bot_message",
+    text: `Applying the uploaded PDF (originally booking ${src.bookingNo}) to booking ${targetBooking} — I'll check the client matches first, add anything missing, and stage the EFT receipt without committing.`,
+  });
+  const cb = pdfPipelineCallbacks(session);
+  delete cb.onError; // this path reports the error itself (avoids a duplicate line)
+  try {
+    const result = await runPdfBooking({
+      username: process.env.TRAMADA_USERNAME,
+      password: process.env.TRAMADA_PASSWORD,
+      data,
+      includeServiceFee: false,
+      dryRunReceipt: true,
+      callbacks: cb,
+    });
+    session.currentBookingNo = result.bookingNo;
+    const nSeg = result.segments.length, nCost = result.costingLines.length;
+    if (result.receiptSkipped) {
+      const did = [nSeg ? `added ${nSeg} segment(s)` : "", nCost ? `added ${nCost} costing line(s)` : ""].filter(Boolean).join(" and ");
+      sendToClient(ws, {
+        type: "bot_message",
+        text: result.nothingToDo
+          ? `Booking ${result.bookingNo} already has these segments and costings and is fully receipted. Nothing to do. ✅`
+          : `${did ? did.charAt(0).toUpperCase() + did.slice(1) + " on" : "Booking"} ${result.bookingNo}; no outstanding balance, so no EFT receipt was needed. ✅`,
+      });
+      return;
+    }
+    session.pendingPdf = { data, filename: `PDF → ${targetBooking}` };
+    session.pendingPdfIssue = { includeServiceFee: false };
+    sendToClient(ws, { type: "pdf_receipt_preview", result, receipt: data.receipt });
+    sendToClient(ws, {
+      type: "bot_message",
+      text: `Staged on booking ${result.bookingNo} — EFT $${data.receipt.amount} (ref ${data.receipt.reference}) is filled in but not issued. Hit “Issue EFT receipt” to commit.`,
+    });
+  } catch (err) {
+    sendToClient(ws, { type: "bot_message", text: `Couldn't apply the PDF to booking ${targetBooking}: ${err.message}` });
   }
 }
 
@@ -1024,6 +1256,8 @@ server.listen(PORT, async () => {
 ║    📡 WebSocket: ws://localhost:${PORT}/ws       ║
 ╚════════════════════════════════════════════════╝
   `);
+  // Marker so you can confirm THIS build is running after a restart.
+  console.log("🧾 PDF pipeline: build 2026-07-27d — supplier/creditor name mismatches are non-fatal; stricter client guard\n");
 
   if (!GEMINI_API_KEY || GEMINI_API_KEY === "your-gemini-api-key-here") {
     console.log("⚠️  Set GEMINI_API_KEY in .env to enable AI chat\n");
