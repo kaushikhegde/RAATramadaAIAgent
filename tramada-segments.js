@@ -492,14 +492,15 @@ async function addHotelSegment(page, bookingNo, seg) {
   await setDateField(page, "#checkOutDate", toTramadaDate(seg.checkOutDate));
   await selectIf(page, "#itinerarystatusTypeCode", seg.status || "HK");
 
-  // Creditor (supplier being paid). Choose "Different from supplier" then set it.
-  // Non-fatal: if the name isn't a listed creditor, record it and carry on.
-  let creditorUnmatched = null;
-  if (seg.creditor) {
+  // Creditor (REQUIRED by Tramada). Choose "Different from supplier" then match
+  // it. If it's missing or doesn't match a listed creditor, STOP and ask the
+  // user — don't skip (Tramada would reject the save) or guess.
+  {
     const diff = page.locator("#creditorDifferentRadio");
     if (await diff.count()) await diff.check().catch(() => {});
-    try { await pickAutocomplete(page, "#costingcreditor", seg.creditor); }
-    catch { creditorUnmatched = seg.creditor; }
+    if (!seg.creditor) throw makeNeedsCreditor("hotel", seg.supplierName);
+    const unmatched = await pickCreditor(page, "#costingcreditor", seg.creditor);
+    if (unmatched) throw makeNeedsCreditor("hotel", unmatched);
   }
 
   // Pricing (this is what makes the hotel receiptable). AUD rate incl GST is the
@@ -514,7 +515,7 @@ async function addHotelSegment(page, bookingNo, seg) {
   await sleep(400);
   await saveSegmentForm(page);
   await assertSaved(page, `Hotel segment ${hotelNameValue || ""}`.trim());
-  return { type: "HTL", reference: hotelNameValue || seg.creditor || "Hotel", creditorUnmatched };
+  return { type: "HTL", reference: hotelNameValue || seg.creditor || "Hotel" };
 }
 
 /* ── Ticket costing (costs a flight so it becomes receiptable) ──────────── */
@@ -564,6 +565,16 @@ async function pickCreditor(page, selector, value) {
   catch { return value; }
 }
 
+// Raise a recognizable "I need a creditor from the user" signal. The caller
+// (server) catches this, PAUSES the run, asks the user for the creditor, and
+// re-runs with their answer — instead of skipping (which then fails Tramada's
+// required "Creditor Name must be entered") or guessing.
+function makeNeedsCreditor(kind, supplierName) {
+  const e = new Error(`Creditor needed for ${kind}${supplierName ? ` "${supplierName}"` : ""}.`);
+  e.needsCreditor = { kind, supplierName: supplierName || "" };
+  return e;
+}
+
 /* ── Tour segment (itinerary) ──────────────────────────────────────────── */
 
 async function addTourSegment(page, bookingNo, seg) {
@@ -576,15 +587,15 @@ async function addTourSegment(page, bookingNo, seg) {
   // Tour company FREE-FORM name (the product, e.g. "Tour East Bali").
   await fillIf(page, "#tourCompanyName", seg.supplierName || seg.tourCompany);
 
-  // Creditor (who Tramada pays). Prefer an explicit override; else try the doc's
-  // supplier name. Choose "Different from supplier" so the field is editable.
-  // Non-fatal: an unmatched creditor is recorded, not thrown.
-  let creditorUnmatched = null;
-  const creditor = seg.creditor || seg.supplierName;
-  if (creditor) {
+  // Creditor (REQUIRED). Choose "Different from supplier" then match it. If it's
+  // missing or unmatched, STOP and ask the user rather than skip/guess.
+  {
     const diff = page.locator('[name="creditorSameOrDifferentFromSupplier"][value="DIFFERENT"]');
     if (await diff.count()) await diff.first().check().catch(() => {});
-    creditorUnmatched = await pickCreditor(page, "#costingcreditor", creditor);
+    const creditor = seg.creditor || seg.supplierName;
+    if (!creditor) throw makeNeedsCreditor("tour", seg.supplierName);
+    const unmatched = await pickCreditor(page, "#costingcreditor", creditor);
+    if (unmatched) throw makeNeedsCreditor("tour", unmatched);
   }
 
   await fillIf(page, "#freeTextDescription", seg.description);
@@ -612,7 +623,7 @@ async function addTourSegment(page, bookingNo, seg) {
   await sleep(400);
   await saveSegmentForm(page);
   await assertSaved(page, `Tour segment ${seg.supplierName || ""}`.trim());
-  return { type: "TUR", reference: seg.reference || seg.supplierName || "Tour", creditorUnmatched };
+  return { type: "TUR", reference: seg.reference || seg.supplierName || "Tour" };
 }
 
 /* ── Insurance costing line ────────────────────────────────────────────── */
@@ -625,7 +636,9 @@ async function addInsuranceCosting(page, bookingNo, ins) {
   await page.waitForSelector("#costingcreditor", { timeout: 15000 });
 
   const creditor = ins.creditor || ins.supplierName; // e.g. "Tokio Marine" (IS on the doc)
-  const creditorUnmatched = creditor ? await pickCreditor(page, "#costingcreditor", creditor) : null;
+  if (!creditor) throw makeNeedsCreditor("insurance", ins.supplierName);
+  const insUnmatched = await pickCreditor(page, "#costingcreditor", creditor);
+  if (insUnmatched) throw makeNeedsCreditor("insurance", insUnmatched);
   await setDateField(page, "#startDate", toTramadaDate(ins.startDate));
   await setDateField(page, "#endDate", toTramadaDate(ins.endDate));
   await selectIf(page, "#statusTypeCode", ins.status || "Confirmed");
@@ -639,7 +652,7 @@ async function addInsuranceCosting(page, bookingNo, ins) {
   await sleep(400);
   await saveSegmentForm(page);
   await assertSaved(page, `Insurance line ${ins.supplierName || ins.creditor || ""}`.trim());
-  return { type: "INS", reference: ins.reference || ins.supplierName || "Insurance", creditorUnmatched };
+  return { type: "INS", reference: ins.reference || ins.supplierName || "Insurance" };
 }
 
 /* ── Service Fee costing line (OPTIONAL) ────────────────────────────────────
@@ -662,7 +675,10 @@ async function addServiceFeeCosting(page, bookingNo, fee) {
   if (fee.feeType) await fillIf(page, "#feeType", fee.feeType);
   await fillIf(page, "#description", fee.description || "Service Fee");
   const creditor = fee.creditor || fee.supplierName;
-  const creditorUnmatched = creditor ? await pickCreditor(page, "#costingcreditor", creditor) : null;
+  if (creditor) {
+    const feeUnmatched = await pickCreditor(page, "#costingcreditor", creditor);
+    if (feeUnmatched) throw makeNeedsCreditor("servicefee", feeUnmatched);
+  }
   await fillIf(page, "#quantity", fee.quantity || 1);
   await setMoneyField(page, "#grossFeeAmountInclGst", fee.amount);
   await fillIf(page, "#issueDate", toTramadaDate(fee.issueDate));
@@ -670,7 +686,7 @@ async function addServiceFeeCosting(page, bookingNo, fee) {
   await sleep(400);
   await saveSegmentForm(page);
   await assertSaved(page, `Service fee ${fee.description || ""}`.trim());
-  return { type: "SFE", reference: fee.description || "Service Fee", creditorUnmatched };
+  return { type: "SFE", reference: fee.description || "Service Fee" };
 }
 
 // Read the costing table so callers can confirm what's receiptable.
@@ -1101,6 +1117,8 @@ async function runPdfBooking({
   data,
   includeServiceFee = false,
   dryRunReceipt = true,
+  forceClient = false, // apply to this booking even if its client differs from
+                       // the PDF (uses THIS booking's client — explicit request)
   callbacks = {},
 } = {}) {
   const onProgress = callbacks.onProgress || (() => {});
@@ -1143,13 +1161,20 @@ async function runPdfBooking({
       const hay = `${header.client || ""} ${header.clientName || ""}`.toUpperCase().replace(/[^A-Z]/g, "");
       clientOk = !surnames.length || surnames.some((s) => hay.includes(s));
     }
-    onStage("verify", { bookingNo, header, clientOk, paxKeys, hdrKey });
-    if (!clientOk) {
+    const clientMismatch = !clientOk;
+    onStage("verify", { bookingNo, header, clientOk, forceClient, paxKeys, hdrKey });
+    if (clientMismatch && !forceClient) {
       throw new Error(
         `Client mismatch — booking ${bookingNo} is "${(header.client || header.clientName || "").trim()}" ` +
           `but the PDF is for ${(data.passengers || []).join(", ")}. Stopping; nothing changed. ` +
           `(This PDF belongs to booking ${data.bookingNo}.)`
       );
+    }
+    if (clientMismatch && forceClient) {
+      // Explicit request to reuse the PDF on a different booking. Segments attach
+      // to THIS booking's passengers and the receipt payer is THIS booking's
+      // client automatically — we just proceed past the guard.
+      onProgress(8, `Booking ${bookingNo} is a different client ("${(header.client || "").trim()}") — applying with THIS booking's client, as requested.`);
     }
 
     // 2) Segments — add Tour/Hotel not already present (idempotent).
@@ -1243,14 +1268,12 @@ async function runPdfBooking({
     }
 
     const nothingToDo = !addedAnything && receiptSkipped;
-    const unmatchedCreditors = [...(segResult || []), ...(costResult || [])]
-      .map((r) => r && r.creditorUnmatched).filter(Boolean);
     onProgress(100, dryRunReceipt ? "Ready — EFT receipt staged (confirm to issue)." : "PDF booking complete.");
     return {
       bookingNo, header,
       segments: segResult, costingLines: costResult, receipt: receiptResult,
       alreadyReceipted, receiptSkipped, receiptSkipReason, nothingToDo, balance,
-      unmatchedCreditors,
+      clientMismatch,
     };
   } catch (err) {
     onError(err.message);

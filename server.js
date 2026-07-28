@@ -215,6 +215,24 @@ async function handleUserMessage(session, userText) {
 
   // ── Pipeline mode: run the whole booking→segments→costing→receipt chain ──
   if (PIPELINE_MODE) {
+    // Awaiting a creditor the run PAUSED on — take this reply as the creditor
+    // name, apply it, and resume the run from where it stopped.
+    if (session.pendingCreditor) {
+      const pc = session.pendingCreditor;
+      const reply = userText.trim();
+      if (/^(cancel|stop|no|nvm|never ?mind|quit)$/i.test(reply)) {
+        session.pendingCreditor = null;
+        sendToClient(ws, { type: "bot_message", text: "Cancelled — stopped there, nothing more changed." });
+        return;
+      }
+      (pc.data.segments || []).forEach((it) => { if (it.kind === pc.needed.kind) it.creditor = reply; });
+      (pc.data.costingLines || []).forEach((it) => { if (it.kind === pc.needed.kind) it.creditor = reply; });
+      session.pendingCreditor = null;
+      sendToClient(ws, { type: "bot_message", text: `Using "${reply}" as the ${pc.needed.kind} creditor — continuing…` });
+      await executePdfRun(session, pc.data, pc.opts);
+      return;
+    }
+
     // If a pipeline is staged and the user confirms, run it now.
     if (
       session.pendingPipeline &&
@@ -232,9 +250,9 @@ async function handleUserMessage(session, userText) {
     }
 
     // "use / apply the same PDF for booking 12806" — apply the last uploaded PDF
-    // to a different booking (the client-match guard keeps it safe).
+    // to a different booking, using THAT booking's own client (explicit request).
     if (session.lastPdf && /\bpdf\b/i.test(userText) && /\b(use|apply|run|create|add|do|same|for)\b/i.test(userText)) {
-      const bkgM = userText.match(/(?:booking\s*(?:no\.?\s*)?|for\s+|to\s+|on\s+|#)(\d{4,6})\b/i) ||
+      const bkgM = userText.match(/(?:booking\s*(?:no\.?\s*)?|for\s+|to\s+|on\s+|#|\()\s*(\d{4,6})\b/i) ||
         userText.match(/\b(\d{4,6})\s+booking\b/i);
       if (bkgM) { await runPdfForBooking(session, bkgM[1]); return; }
     }
@@ -508,6 +526,83 @@ function pdfPipelineCallbacks(session) {
   };
 }
 
+// Run one PDF pipeline stage and handle the outcome — including the "needs
+// creditor" PAUSE: when a creditor can't be resolved, we stop, remember the run
+// context in session.pendingCreditor, and ask the user. Their next chat message
+// is taken as the creditor and the run resumes (see handleUserMessage).
+async function executePdfRun(session, data, opts) {
+  const { ws } = session;
+  const cb = pdfPipelineCallbacks(session);
+  delete cb.onError; // this function reports errors itself (avoids a duplicate line)
+  try {
+    const result = await runPdfBooking({
+      username: process.env.TRAMADA_USERNAME,
+      password: process.env.TRAMADA_PASSWORD,
+      data,
+      includeServiceFee: opts.includeServiceFee,
+      dryRunReceipt: opts.dryRunReceipt !== false,
+      forceClient: !!opts.forceClient,
+      callbacks: cb,
+    });
+    session.currentBookingNo = result.bookingNo;
+    session.pendingCreditor = null;
+    const nSeg = result.segments.length, nCost = result.costingLines.length;
+
+    if (result.clientMismatch) {
+      const who = (result.header && (result.header.client || result.header.clientName)) || "a different client";
+      sendToClient(ws, {
+        type: "bot_message",
+        text: `ℹ️ Booking ${result.bookingNo} is ${who} — different from the PDF (${(data.passengers || []).join(", ")}). I used booking ${result.bookingNo}'s client, as you asked.`,
+      });
+    }
+
+    if (result.receiptSkipped) {
+      session.pendingPdf = null;
+      session.pendingPdfIssue = null;
+      const did = [nSeg ? `added ${nSeg} segment(s)` : "", nCost ? `added ${nCost} costing line(s)` : ""].filter(Boolean).join(" and ");
+      sendToClient(ws, {
+        type: "bot_message",
+        text: result.nothingToDo
+          ? `Booking ${result.bookingNo} already has everything and is fully receipted (balance ${Number(result.balance).toFixed(2)}). Nothing to do. ✅`
+          : `${did ? did.charAt(0).toUpperCase() + did.slice(1) + " on " : ""}booking ${result.bookingNo}; no outstanding balance, so no EFT receipt was needed. ✅`,
+      });
+      return;
+    }
+
+    session.pendingPdf = { data, filename: `PDF-${result.bookingNo}` };
+    session.pendingPdfIssue = { includeServiceFee: opts.includeServiceFee, forceClient: !!opts.forceClient };
+    sendToClient(ws, { type: "pdf_receipt_preview", result, receipt: data.receipt });
+    sendToClient(ws, {
+      type: "bot_message",
+      text:
+        `Segments and costings are in for booking ${result.bookingNo}. The EFT receipt for ` +
+        `$${data.receipt.amount} (ref ${data.receipt.reference}, allocate all) is staged but NOT issued. ` +
+        `Hit "Issue EFT receipt" to commit it.`,
+    });
+  } catch (err) {
+    if (err && err.needsCreditor) {
+      // PAUSE — remember where to resume, then ask the user for the creditor.
+      session.pendingCreditor = { needed: err.needsCreditor, data, opts };
+      const n = err.needsCreditor;
+      sendToClient(ws, {
+        type: "bot_message",
+        text:
+          `✋ I couldn't match a Tramada creditor for the ${n.kind}${n.supplierName ? ` "${n.supplierName}"` : ""}. ` +
+          `Reply with the exact Tramada creditor name to use (it must be a creditor that exists in Tramada) and I'll continue — or say "cancel" to stop.`,
+      });
+      return;
+    }
+    const needsLogin = /not logged in|log into tramada|login/i.test(err.message || "");
+    sendToClient(ws, { type: "error", text: `PDF run failed: ${err.message}` });
+    sendToClient(ws, {
+      type: "bot_message",
+      text: needsLogin
+        ? "Sign into Tramada in the port-9222 Chrome window, then say **retry**."
+        : "Say **retry** to run it again — it skips whatever already saved — or tell me what to change.",
+    });
+  }
+}
+
 async function handleTramadaPdfUpload(session, msg) {
   const { ws } = session;
   const stage = msg.stage || "parse";
@@ -550,48 +645,7 @@ async function handleTramadaPdfUpload(session, msg) {
     // Step 2 — create segments + costings, STAGE (don't commit) the EFT receipt.
     if (stage === "create") {
       sendToClient(ws, { type: "bot_message", text: "On it — adding segments and costings, and staging the EFT receipt. Progress below." });
-      const result = await runPdfBooking({
-        username: process.env.TRAMADA_USERNAME,
-        password: process.env.TRAMADA_PASSWORD,
-        data,
-        includeServiceFee,
-        dryRunReceipt: true, // stage only — confirm before issue
-        callbacks: pdfPipelineCallbacks(session),
-      });
-      session.currentBookingNo = result.bookingNo;
-      const nSeg = result.segments.length, nCost = result.costingLines.length;
-
-      if (result.unmatchedCreditors && result.unmatchedCreditors.length) {
-        sendToClient(ws, {
-          type: "bot_message",
-          text: `⚠️ These creditor names from the doc didn't match a Tramada creditor, so I saved the line(s) without a creditor — set them in Tramada (or re-run with the right creditor): ${[...new Set(result.unmatchedCreditors)].join(", ")}.`,
-        });
-      }
-
-      // Fully-paid / nothing-outstanding booking → no receipt to stage. Report
-      // it plainly instead of showing an empty receipt card.
-      if (result.receiptSkipped) {
-        session.pendingPdfIssue = null;
-        session.pendingPdf = null;
-        const did = [nSeg ? `added ${nSeg} segment(s)` : "", nCost ? `added ${nCost} costing line(s)` : ""].filter(Boolean).join(" and ");
-        sendToClient(ws, {
-          type: "bot_message",
-          text: result.nothingToDo
-            ? `Booking ${result.bookingNo} already has everything — all segments and costings are present and it's fully receipted (balance ${Number(result.balance).toFixed(2)}). Nothing to do. ✅`
-            : `${did ? did.charAt(0).toUpperCase() + did.slice(1) + " on" : "Booking"} ${result.bookingNo}. It has no outstanding balance (${Number(result.balance).toFixed(2)}), so there's no EFT receipt to raise. Done. ✅`,
-        });
-        return;
-      }
-
-      session.pendingPdfIssue = { includeServiceFee };
-      sendToClient(ws, { type: "pdf_receipt_preview", result, receipt: data.receipt });
-      sendToClient(ws, {
-        type: "bot_message",
-        text:
-          `Segments and costings are in for booking ${result.bookingNo}. The EFT receipt for ` +
-          `$${data.receipt.amount} (ref ${data.receipt.reference}, allocate all) is staged but NOT issued. ` +
-          `Hit “Issue EFT receipt” to commit it.`,
-      });
+      await executePdfRun(session, data, { includeServiceFee, dryRunReceipt: true, forceClient: false });
       return;
     }
 
@@ -605,6 +659,7 @@ async function handleTramadaPdfUpload(session, msg) {
         data,
         includeServiceFee: (session.pendingPdfIssue && session.pendingPdfIssue.includeServiceFee) || includeServiceFee,
         dryRunReceipt: false, // commit
+        forceClient: !!(session.pendingPdfIssue && session.pendingPdfIssue.forceClient),
         callbacks: pdfPipelineCallbacks(session),
       });
       session.currentBookingNo = result.bookingNo;
@@ -650,41 +705,11 @@ async function runPdfForBooking(session, targetBooking) {
   const data = { ...src, bookingNo: String(targetBooking), receipt: { ...src.receipt } };
   sendToClient(ws, {
     type: "bot_message",
-    text: `Applying the uploaded PDF (originally booking ${src.bookingNo}) to booking ${targetBooking} — I'll check the client matches first, add anything missing, and stage the EFT receipt without committing.`,
+    text: `Applying the uploaded PDF (originally booking ${src.bookingNo}) to booking ${targetBooking} using booking ${targetBooking}'s OWN client, and staging the EFT receipt without committing.`,
   });
-  const cb = pdfPipelineCallbacks(session);
-  delete cb.onError; // this path reports the error itself (avoids a duplicate line)
-  try {
-    const result = await runPdfBooking({
-      username: process.env.TRAMADA_USERNAME,
-      password: process.env.TRAMADA_PASSWORD,
-      data,
-      includeServiceFee: false,
-      dryRunReceipt: true,
-      callbacks: cb,
-    });
-    session.currentBookingNo = result.bookingNo;
-    const nSeg = result.segments.length, nCost = result.costingLines.length;
-    if (result.receiptSkipped) {
-      const did = [nSeg ? `added ${nSeg} segment(s)` : "", nCost ? `added ${nCost} costing line(s)` : ""].filter(Boolean).join(" and ");
-      sendToClient(ws, {
-        type: "bot_message",
-        text: result.nothingToDo
-          ? `Booking ${result.bookingNo} already has these segments and costings and is fully receipted. Nothing to do. ✅`
-          : `${did ? did.charAt(0).toUpperCase() + did.slice(1) + " on" : "Booking"} ${result.bookingNo}; no outstanding balance, so no EFT receipt was needed. ✅`,
-      });
-      return;
-    }
-    session.pendingPdf = { data, filename: `PDF → ${targetBooking}` };
-    session.pendingPdfIssue = { includeServiceFee: false };
-    sendToClient(ws, { type: "pdf_receipt_preview", result, receipt: data.receipt });
-    sendToClient(ws, {
-      type: "bot_message",
-      text: `Staged on booking ${result.bookingNo} — EFT $${data.receipt.amount} (ref ${data.receipt.reference}) is filled in but not issued. Hit “Issue EFT receipt” to commit.`,
-    });
-  } catch (err) {
-    sendToClient(ws, { type: "bot_message", text: `Couldn't apply the PDF to booking ${targetBooking}: ${err.message}` });
-  }
+  // executePdfRun handles the outcome AND the "needs creditor" pause/resume.
+  await executePdfRun(session, data, { includeServiceFee: false, dryRunReceipt: true, forceClient: true });
+  return;
 }
 
 // ─── Start automation ────────────────────────────────────────────
@@ -1257,7 +1282,7 @@ server.listen(PORT, async () => {
 ╚════════════════════════════════════════════════╝
   `);
   // Marker so you can confirm THIS build is running after a restart.
-  console.log("🧾 PDF pipeline: build 2026-07-27d — supplier/creditor name mismatches are non-fatal; stricter client guard\n");
+  console.log("🧾 PDF pipeline: build 2026-07-27f — stops & asks you for a creditor when it cannot match one\n");
 
   if (!GEMINI_API_KEY || GEMINI_API_KEY === "your-gemini-api-key-here") {
     console.log("⚠️  Set GEMINI_API_KEY in .env to enable AI chat\n");
