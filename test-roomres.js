@@ -515,15 +515,23 @@ check("receipt declined ends cleanly", noRcpt.state.step, "done");
 r = chat.advance(r.state, "yes");
 check("receipt details asked", r.state.step, "receiptDetails");
 r = chat.advance(r.state, "780.00 RR788851");
-check("receipt staged as a dry run", r.state.data.dryRunReceipt, true);
 check("EFT by default", r.state.data.receipt.transactionType, "EFT");
 check("reference parsed", r.state.data.receipt.reference, "RR788851");
-check("runs the receipt", r.run, "receipt");
+// No dry-run pass any more: the details are confirmed in the chat, not by
+// driving the browser once to stage and a second time to issue.
+check("confirms before touching the browser", r.state.step, "receiptConfirm");
+check("no browser run to stage it", r.run, null);
+check("never staged as a dry run", r.state.data.dryRunReceipt, false);
+ok("the confirmation quotes the parsed details", /\$780\.00/.test(r.messages[0]) && /RR788851/.test(r.messages[0]), r.messages[0]);
+ok("and names the defaulted method", /EFT/.test(r.messages[0]), r.messages[0]);
 
-r = chat.resume(r.state, "receipt", { staged: true });
-check("waits for confirmation before issuing", r.state.step, "receiptConfirm");
+// Declining still leaves the booking and segment in place.
+const noIssue = chat.advance(r.state, "no");
+check("declining ends cleanly", noIssue.state.step, "done");
+ok("and says nothing was issued", /unissued/i.test(noIssue.messages[0]), noIssue.messages[0]);
+
 r = chat.advance(r.state, "yes");
-check("issuing is a second, explicit run", [r.run, r.state.data.dryRunReceipt], ["receipt", false]);
+check("issuing is the ONLY browser run", [r.run, r.state.data.dryRunReceipt], ["receipt", false]);
 r = chat.resume(r.state, "receipt", { issued: true });
 check("done", r.state.step, "done");
 
@@ -598,7 +606,8 @@ const cashRec = recAt("110.00, JHJ-12806, Cash");
 check("the payment method is honoured", cashRec.state.data.receipt.transactionType, "Cash");
 check("the reference survives the method word", cashRec.state.data.receipt.reference, "JHJ-12806");
 check("the amount survives the commas", cashRec.state.data.receipt.amount, 110);
-ok("and the staging line says Cash", /Staging a Cash receipt/.test(cashRec.messages[0]), cashRec.messages[0]);
+ok("and the confirmation says Cash", /\bCash receipt\b/.test(cashRec.messages[0]), cashRec.messages[0]);
+ok("and doesn't claim it's only staged", !/staged|not issuing/i.test(cashRec.messages[0]), cashRec.messages[0]);
 
 // The method leading the line must not be mistaken for the reference.
 const leadRec = recAt("Cash 110 REF123");

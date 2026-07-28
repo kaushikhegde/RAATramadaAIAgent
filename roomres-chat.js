@@ -408,7 +408,7 @@ function advance(state, text) {
             `Receipt details, please: amount, reference and how it was paid — e.g. ` +
               `\`${Number(d.quotedPrice || 0).toFixed(2)} REF12345 Cash\`. ` +
               "(Cash, EFT, Cheque or Credit Card — I'll assume EFT if you don't say.) " +
-              "I'll stage it for you to check before anything is issued.",
+              "I'll read it back to you before issuing anything.",
           ],
           run: null,
         };
@@ -435,15 +435,22 @@ function advance(state, text) {
       }
       const transactionType = payType || "EFT";
       d.receipt = { transactionType, amount, reference: ref, allocation: "ALL" };
-      d.dryRunReceipt = true;
+      // No dry-run pass. Staging used to drive a WHOLE extra browser round trip
+      // (log in, open the booking, read segments, fill the form, screenshot)
+      // purely to show numbers we already hold — then throw it away and do it
+      // all again to issue. The confirmation is worth keeping, because these
+      // values are parsed out of free text and the method DEFAULTS to EFT, but
+      // it costs nothing to do it here in the chat.
+      d.dryRunReceipt = false;
       return {
         state: { ...state, step: "receiptConfirm", data: d },
         messages: [
-          `Staging a ${transactionType} receipt of $${amount.toFixed(2)} (ref ${ref})` +
+          `Issuing a ${transactionType} receipt of $${amount.toFixed(2)} (ref ${ref}), allocated across the booking` +
             (payType ? "" : " — defaulted to EFT, say the method if it's something else") +
-            " — not issuing it yet…",
+            ".",
+          "Go ahead? **yes** / **no**.",
         ],
-        run: "receipt",
+        run: null,
       };
     }
 
@@ -613,16 +620,11 @@ function resume(state, action, result) {
 
     case "receipt": {
       d.receiptResult = result;
-      if (state.step === "receiptIssue" || d.dryRunReceipt === false) {
-        return { state: { ...state, step: "done", data: d }, messages: [`Receipt issued against booking ${d.bookingNo}. All done. ✅`], run: null };
-      }
+      // The chat confirms in text and never dry-runs, so a receipt run that
+      // gets here was a real one.
       return {
-        state: { ...state, step: "receiptConfirm", data: d },
-        messages: [
-          `Receipt staged (not issued): $${Number(d.receipt.amount).toFixed(2)} ${d.receipt.transactionType || "EFT"}, ` +
-            `ref ${d.receipt.reference}, allocated across the booking.`,
-          "Issue it? **yes** / **no**.",
-        ],
+        state: { ...state, step: "done", data: d },
+        messages: [`Receipt issued against booking ${d.bookingNo}. All done. ✅`],
         run: null,
       };
     }
