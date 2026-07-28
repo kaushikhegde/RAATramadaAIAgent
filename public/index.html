@@ -494,6 +494,11 @@
     background: rgba(255, 230, 0, 0.1);
   }
 
+  /* Solid rather than dashed: this one starts a flow, it doesn't open a picker. */
+  .quote-btn {
+    border-style: solid;
+  }
+
   #pdfInput { display: none; }
 
   /* ── Booking summary card ── */
@@ -678,6 +683,7 @@
     <div class="input-area">
       <input type="file" id="pdfInput" accept=".pdf">
       <button class="upload-btn" onclick="document.getElementById('pdfInput').click()" title="Upload an RAA itinerary PDF">&#128206; Itinerary PDF</button>
+      <button class="upload-btn quote-btn" onclick="startRoomResQuote()" title="Room-Res hotel quote, then the Tramada segment and receipt">&#127976; Create Quote</button>
       <input type="text" id="userInput" placeholder="Type a message..."
              onkeydown="if(event.key==='Enter' && !event.shiftKey) sendMessage()">
       <button class="send-btn" id="sendBtn" onclick="sendMessage()">&#10148;</button>
@@ -899,6 +905,18 @@
     ws.send(JSON.stringify({ type: 'user_message', text }));
 
     userInput.value = '';
+    isProcessing = true;
+    sendBtn.disabled = true;
+    showTypingIndicator();
+  }
+
+  // Start the Room-Res quote flow. Sent as its own message type rather than the
+  // words "create quote", so the button never depends on the server's phrase
+  // matching — but a bubble still goes in the transcript so it reads normally.
+  function startRoomResQuote() {
+    if (isProcessing || !ws || ws.readyState !== WebSocket.OPEN) return;
+    addUserMessage('Create a Room-Res quote');
+    ws.send(JSON.stringify({ type: 'roomres_start' }));
     isProcessing = true;
     sendBtn.disabled = true;
     showTypingIndicator();

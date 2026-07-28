@@ -13,7 +13,9 @@
     "validate": "node booking.js --validate-only",
     "book:chrome": "USE_PLAYWRIGHT=true BROWSER_CHANNEL=chrome HEADLESS=false node booking.js",
     "start:chrome": "./start-chrome.sh",
-    "book:cdp": "node booking.js"
+    "book:cdp": "node booking.js",
+    "test:roomres": "node test-roomres.js",
+    "test:bookform": "node test-roomres-bookform.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.0",

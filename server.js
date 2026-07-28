@@ -27,6 +27,9 @@ const { runTramadaAddAndSearch } = require("./tramada-booking");
 const { runTramadaReceipt, searchBookingsForReceipt } = require("./tramada-receipt");
 const { runFullBooking, runReadBookingState, runPdfBooking } = require("./tramada-segments");
 const { parseRaaItineraryBuffer } = require("./pdf-itinerary");
+const { runRoomResDraft, runRoomResQuote, closeRoomResPage } = require("./room-res-quote");
+const { runRoomResToTramada, findTramadaClients, lookupBookingClient } = require("./room-res-tramada");
+const roomResChat = require("./roomres-chat");
 
 // ─── Config ──────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -124,6 +127,8 @@ function createSession(ws) {
     bookingData: null,        // Extracted booking JSON
     automationRunning: false,
     geminiChat: null,         // Gemini chat session
+    roomRes: null,            // Room-Res quote conversation (roomres-chat.js state)
+    roomResPending: null,      // that flow paused on a question only the user can answer (creditor / city)
   };
 }
 
@@ -173,6 +178,12 @@ async function handleClientMessage(session, msg) {
       await handleTramadaPdfUpload(session, msg);
       break;
 
+    // Room-Res hotel quote → Tramada segment (+ optional receipt). The button
+    // does exactly what typing "create quote" does — one flow, one code path.
+    case "roomres_start":
+      await handleRoomResStart(session);
+      break;
+
     case "tramada_search":
       await handleTramadaSearch(session, msg.username, msg.password);
       break;
@@ -212,6 +223,42 @@ async function handleUserMessage(session, userText) {
 
   // Show typing indicator
   sendToClient(ws, { type: "typing" });
+
+  // ── Room-Res quote flow ──
+  // Ahead of everything else, and deliberately outside the PIPELINE_MODE gate:
+  // once this conversation is running it owns the user's messages, so a bare
+  // "yes" means yes to ITS question and not to something staged earlier — and
+  // the "Create quote" button works whichever way the server was started.
+  if (session.roomResPending) {
+    const reply = userText.trim();
+    const kind = session.roomResPending.kind;
+    if (/^(cancel|stop|no|nvm|never ?mind|quit)$/i.test(reply)) {
+      session.roomResPending = null;
+      session.roomRes = null;
+      await closeRoomResPage().catch(() => {});
+      sendToClient(ws, { type: "bot_message", text: "Cancelled — the Room-Res quote is still there, but nothing went into Tramada." });
+      return;
+    }
+    sendToClient(ws, {
+      type: "bot_message",
+      text:
+        kind === "city"
+          ? `Using "${reply}" as the Tramada city — carrying on…`
+          : `Using "${reply}" as the creditor — carrying on…`,
+    });
+    await resumeRoomResPending(session, reply);
+    return;
+  }
+
+  if (session.roomRes) {
+    await stepRoomRes(session, userText);
+    return;
+  }
+
+  if (roomResChat.isStart(userText)) {
+    await handleRoomResStart(session);
+    return;
+  }
 
   // ── Pipeline mode: run the whole booking→segments→costing→receipt chain ──
   if (PIPELINE_MODE) {
@@ -501,6 +548,172 @@ async function handlePdfUpload(session, filename, base64Data) {
       text: `Couldn't read that PDF: ${err.message}. Try telling me your booking details instead!`,
     });
   }
+}
+
+// ─── Room-Res quote flow ─────────────────────────────────────────
+// The conversation itself lives in roomres-chat.js (a pure state machine); this
+// is only the part that owns the browser. Each turn: advance the machine, send
+// whatever it wants to say, and if it asked for a browser action, run it and
+// feed the result back in. Loops because one action's result often leads
+// straight into the next (guests → draft, price → quote).
+
+function roomResCallbacks(session) {
+  const { ws } = session;
+  return {
+    onProgress: (pct, m) => session.active && sendToClient(ws, { type: "pipeline_progress", percent: pct, message: m }),
+    onStage: (name, d) => session.active && sendToClient(ws, { type: "pipeline_stage", stage: `roomres:${name}`, data: d }),
+    onError: () => {}, // reported by the caller, with the step's own wording
+    onNeedLogin: () =>
+      session.active &&
+      sendToClient(ws, {
+        type: "bot_message",
+        text:
+          "🔐 Sign into **Room-Res** (and Tramada) in the Chrome window on port 9222 — " +
+          "I'll spot it and carry on. I never type credentials myself.",
+      }),
+  };
+}
+
+// Execute one browser action for the flow. Returns whatever the action produced,
+// or `{ error }` — resume() knows how to put the conversation back on its feet.
+async function runRoomResAction(session, action) {
+  const st = session.roomRes;
+  const d = st.data;
+  const callbacks = roomResCallbacks(session);
+  const auth = { username: process.env.TRAMADA_USERNAME, password: process.env.TRAMADA_PASSWORD };
+
+  switch (action) {
+    case "bookingClient":
+      return await lookupBookingClient({ ...auth, bookingNo: d.existingBookingNo, callbacks });
+
+    case "draft":
+      return await runRoomResDraft({ ...roomResChat.draftArgs(st), callbacks });
+
+    case "quote":
+      return await runRoomResQuote({
+        itineraryId: d.itineraryId,
+        itineraryCode: d.itineraryCode,
+        quotedPrice: d.quotedPrice,
+        title: `${d.draft.hotelName} — ${d.draft.city}`,
+        callbacks,
+      });
+
+    case "clients":
+      return await findTramadaClients({ ...auth, surname: d.surname, callbacks });
+
+    case "tramada":
+      return await runRoomResToTramada({ ...auth, ...roomResChat.tramadaArgs(st), callbacks });
+
+    case "receipt":
+      return await runRoomResToTramada({
+        ...auth,
+        ...roomResChat.tramadaArgs(st),
+        existingBookingNo: d.bookingNo || d.existingBookingNo,
+        receipt: d.receipt,
+        dryRunReceipt: d.dryRunReceipt !== false,
+        // The "tramada" action already put the segment on this booking. Without
+        // this the receipt step added a duplicate one — and it runs twice
+        // (stage, then issue), so it added two.
+        receiptOnly: true,
+        callbacks,
+      });
+
+    default:
+      throw new Error(`Unknown Room-Res action: ${action}`);
+  }
+}
+
+// Run the machine forward from a turn's output until it wants the user again.
+// Split out from stepRoomRes so a creditor answer can re-enter mid-flow, at the
+// exact action that stopped, without pushing a message through advance().
+async function driveRoomRes(session, out) {
+  const { ws } = session;
+
+  for (let hop = 0; hop < 8; hop++) {
+    session.roomRes = out.state;
+    for (const m of out.messages || []) sendToClient(ws, { type: "bot_message", text: m });
+    // The Room-Res tab is now held open BETWEEN phases, so the run's browser
+    // page outlives a single action — it belongs to the conversation. Release it
+    // exactly where the conversation ends, and nowhere else: "waiting on the
+    // user" is the case the whole thing exists for, so it must not close there.
+    if (!out.state) { await closeRoomResPage().catch(() => {}); return; }   // cancelled
+    if (!out.run) return;                                                   // waiting on the user
+    if (out.state.step === "done") { await closeRoomResPage().catch(() => {}); return; }
+
+    const action = out.run;
+    sendToClient(ws, { type: "typing" });
+    let result;
+    try {
+      result = await runRoomResAction(session, action);
+    } catch (err) {
+      // Same pause-and-ask as the PDF pipeline: an unmatched creditor stops the
+      // run, we ask, and the answer resumes it. Remembering the answer is
+      // creditor-aliases' job, and only once the run has actually succeeded.
+      // Two questions only the user can answer, both handled the same way: park
+      // the action, ask, and re-run the SAME action once the answer lands.
+      if (err && err.needsCreditor) {
+        session.roomResPending = { action, kind: "creditor", needed: err.needsCreditor };
+        sendToClient(ws, {
+          type: "bot_message",
+          text:
+            `✋ I couldn't match a Tramada creditor for ${err.needsCreditor.supplierName || "this hotel"}. ` +
+            "Reply with the exact Tramada creditor name and I'll carry on — or say **cancel** to stop. " +
+            "(The booking goes against the hotel itself, so this needs to be right.)",
+        });
+        return;
+      }
+      if (err && err.needsCity) {
+        session.roomResPending = { action, kind: "city", needed: err.needsCity };
+        const tried = (err.needsCity.tried || []).join(", ");
+        sendToClient(ws, {
+          type: "bot_message",
+          text:
+            `✋ Tramada wouldn't accept a City Code for this hotel — I tried ${tried || "everything I had"}. ` +
+            "Room-Res reports the suburb rather than the city, so reply with the Tramada city (e.g. **Sydney** or **SYD**) " +
+            "and I'll carry on — or say **cancel** to stop.",
+        });
+        return;
+      }
+      result = { error: err.message };
+    }
+    out = roomResChat.resume(session.roomRes, action, result);
+  }
+
+  sendToClient(ws, { type: "bot_message", text: "That's gone around further than expected — stopping here. Say **create quote** to start again." });
+  session.roomRes = null;
+  await closeRoomResPage().catch(() => {}); // the runaway-loop exit is an end too
+}
+
+// Drive the flow from the user's message all the way to its next question.
+async function stepRoomRes(session, userText) {
+  await driveRoomRes(session, roomResChat.advance(session.roomRes, userText));
+}
+
+// Start (or restart) the flow — from the "Create quote" button or the chat.
+async function handleRoomResStart(session) {
+  const { ws } = session;
+  session.roomResPending = null;
+  // A new run must not inherit the previous run's tab — that one is parked on
+  // someone else's itinerary.
+  await closeRoomResPage().catch(() => {});
+  const started = roomResChat.startQuoteFlow();
+  session.roomRes = started.state;
+  for (const m of started.messages) sendToClient(ws, { type: "bot_message", text: m });
+}
+
+// The user has answered the creditor question. Put the name on the flow's data
+// so tramadaArgs() carries it, then re-run the action that stopped — not the
+// next one, and not through advance(), because the conversation never moved on.
+async function resumeRoomResPending(session, reply) {
+  const pending = session.roomResPending;
+  session.roomResPending = null;
+  if (!session.roomRes) {
+    sendToClient(session.ws, { type: "bot_message", text: "That flow has already finished — say **create quote** to start another." });
+    return;
+  }
+  if (pending.kind === "city") session.roomRes.data.cityCode = reply;
+  else session.roomRes.data.creditor = reply;
+  await driveRoomRes(session, { state: session.roomRes, messages: [], run: pending.action });
 }
 
 // ─── Handle RAA itinerary PDF → Tramada (segments + costings + EFT receipt) ──
@@ -1282,7 +1495,7 @@ server.listen(PORT, async () => {
 ╚════════════════════════════════════════════════╝
   `);
   // Marker so you can confirm THIS build is running after a restart.
-  console.log("🧾 PDF pipeline: build 2026-07-27f — stops & asks you for a creditor when it cannot match one\n");
+  console.log("🧾 PDF pipeline: build 2026-07-28a — plus the Room-Res \"create quote\" flow (hotel quote → Tramada segment → receipt)\n");
 
   if (!GEMINI_API_KEY || GEMINI_API_KEY === "your-gemini-api-key-here") {
     console.log("⚠️  Set GEMINI_API_KEY in .env to enable AI chat\n");

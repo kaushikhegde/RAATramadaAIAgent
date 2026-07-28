@@ -303,9 +303,30 @@ async function setDateField(page, selector, value) {
   }
 }
 
-// Read any validation errors after a save.
+/**
+ * Read any validation errors after a save.
+ *
+ * This runs the instant a save is judged to have failed, which is exactly when
+ * Tramada may still be swapping the document — and in that window
+ * `document.body` is NULL. Reading `.innerText` off it threw
+ * "Cannot read properties of null (reading 'innerText')", which then surfaced
+ * AS the run's failure and buried the real one: this function exists to read
+ * the validation message, so its own crash replaced "City Code is invalid" with
+ * a stack trace. Wait for the document, guard the body, and retry.
+ */
 async function readSaveErrors(page) {
+  await page.waitForLoadState("domcontentloaded").catch(() => {});
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const out = await _readSaveErrorsOnce(page).catch(() => null);
+    if (out) return out;
+    await sleep(400);
+  }
+  return [];
+}
+
+async function _readSaveErrorsOnce(page) {
   return await page.evaluate(() => {
+    if (!document.body) return null; // mid-navigation — the caller retries
     const out = [];
     const sels = [
       'div[style*="border"][style*="red"]',
@@ -358,6 +379,61 @@ async function setMoneyField(page, selector, value) {
   if (Math.abs(parseFloat(got || "0") - parseFloat(String(value))) > 0.001) {
     throw new Error(`Field ${selector} ended up as "${got}" (expected ${value})`);
   }
+}
+
+// Candidate ids/attribute matches for the "Confirmation / Reference Number" box.
+// Tramada names this field differently per segment form — the tour form uses
+// #itineraryconfirmationOrReferenceNumber, insurance uses
+// #confirmationOrReferenceNumber — and the hotel form's id could not be read
+// directly (the browser wasn't signed in, and I won't guess at a field that
+// carries the booking reference). So we PROBE, most-specific first, and report
+// which one we used rather than hard-coding a guess.
+const CONFIRMATION_REF_SELECTORS = [
+  "#itineraryconfirmationOrReferenceNumber",
+  "#confirmationOrReferenceNumber",
+  "#itineraryconfirmationNumber",
+  "#confirmationNumber",
+  "#itineraryreferenceNumber",
+  "#referenceNumber",
+  'input[name*="confirmationOrReference" i]',
+  'input[name*="confirmation" i]',
+  'input[id*="confirmation" i]',
+  'input[name*="referenceNumber" i]',
+  'input[id*="referenceNumber" i]',
+];
+
+/**
+ * Write the booking reference (e.g. "Q422380 / AQ788851") into whichever
+ * confirmation/reference field this form actually has.
+ *
+ * NON-FATAL by design: if no candidate exists, the segment is still correct in
+ * every other respect, and losing the whole run over a cosmetic-ish field would
+ * be worse than saving without it. Returns the selector that took the value, or
+ * null — callers log it so the real id gets pinned down on the first live run.
+ */
+async function setConfirmationRef(page, value) {
+  if (value == null || value === "") return null;
+  for (const sel of CONFIRMATION_REF_SELECTORS) {
+    const el = page.locator(sel);
+    let n = 0;
+    try { n = await el.count(); } catch { continue; }
+    if (!n) continue;
+    const first = el.first();
+    const usable = await first
+      .evaluate((node) => {
+        if (node.type === "hidden" || node.readOnly || node.disabled) return false;
+        // A zero-size node is a template/offscreen field, not the real one.
+        const r = node.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      })
+      .catch(() => false);
+    if (!usable) continue;
+    try {
+      await first.fill(String(value), { timeout: 8000 });
+      return sel;
+    } catch { /* try the next candidate */ }
+  }
+  return null;
 }
 
 /**
@@ -483,14 +559,51 @@ async function addHotelSegment(page, bookingNo, seg) {
   if (!pickedSupplier) {
     await fillIf(page, "#hotelName", hotelNameValue);
   }
-  // City Code (#checkInLocation) autocomplete — non-fatal (a doc city that
-  // doesn't match a Tramada city won't kill the save).
-  try { await pickAutocomplete(page, "#checkInLocation", seg.cityCode || seg.city); } catch { /* leave blank */ }
+  // City Code (#checkInLocation). Tramada REJECTS the save with "City Code is
+  // invalid" when this is blank, so one shot at one value is not enough — and
+  // the value most likely to be wrong is the one we used to try first.
+  //
+  // Room-Res reports the SUBURB, not the city: "Haymarket" for a hotel in
+  // Sydney, "Bondi Junction" for one in Sydney's east. Neither is a Tramada
+  // city, so the autocomplete found nothing, the catch swallowed it, the field
+  // stayed empty and Tramada refused the segment. The city the user actually
+  // searched ("Sydney") is the reliable answer, so seg.cityCandidates carries it
+  // ahead of the suburb. Try each in turn and keep the first that registers.
+  const cityTried = [];
+  let cityCodeSet = null;
+  for (const candidate of (seg.cityCandidates && seg.cityCandidates.length
+    ? seg.cityCandidates
+    : [seg.cityCode, seg.city])) {
+    if (!candidate || cityTried.includes(candidate)) continue;
+    cityTried.push(candidate);
+    try {
+      const got = await pickAutocomplete(page, "#checkInLocation", candidate);
+      if (got) { cityCodeSet = got; break; }
+    } catch { /* try the next candidate */ }
+  }
+  // Stop and ask rather than save a form Tramada will reject. Same contract as
+  // the creditor question below: the caller asks, the answer comes back as
+  // seg.cityCode, and the whole action is re-run.
+  if (!cityCodeSet && cityTried.length) throw makeNeedsCity(cityTried, seg.city);
   await selectIf(page, "#roomTypeCode", seg.roomTypeCode);
   await fillIf(page, "#roomType", seg.roomType);           // free-form room type
   await setDateField(page, "#checkInDate", toTramadaDate(seg.checkInDate));
   await setDateField(page, "#checkOutDate", toTramadaDate(seg.checkOutDate));
   await selectIf(page, "#itinerarystatusTypeCode", seg.status || "HK");
+
+  // Confirmation / reference number. For a Room-Res booking this carries BOTH
+  // numbers together — "Q422380 / AQ788851" (quote / itinerary) — so the segment
+  // can be traced back to the portal record from inside Tramada.
+  const refField = await setConfirmationRef(
+    page,
+    seg.confirmationNumber || seg.reference || seg.confirmationOrReference
+  );
+  if (seg.confirmationNumber && !refField) {
+    // Don't fail — but make the gap visible so the real id can be pinned down.
+    console.warn(
+      `[tramada] No confirmation/reference field found on the hotel segment form; "${seg.confirmationNumber}" was not recorded.`
+    );
+  }
 
   // Creditor (REQUIRED by Tramada). Choose "Different from supplier" then match
   // it. If it's missing or doesn't match a listed creditor, STOP and ask the
@@ -514,8 +627,25 @@ async function addHotelSegment(page, bookingNo, seg) {
 
   await sleep(400);
   await saveSegmentForm(page);
-  await assertSaved(page, `Hotel segment ${hotelNameValue || ""}`.trim());
-  return { type: "HTL", reference: hotelNameValue || seg.creditor || "Hotel" };
+  try {
+    await assertSaved(page, `Hotel segment ${hotelNameValue || ""}`.trim());
+  } catch (err) {
+    // "City Code is invalid" is the one rejection we can explain precisely, so
+    // say which values were offered rather than leaving the agent to guess at a
+    // field the automation filled.
+    if (/city\s*code/i.test(err.message) && cityTried.length) {
+      err.message +=
+        ` — none of ${cityTried.join(", ")} matched a Tramada city.` +
+        " Room-Res reports the suburb rather than the city, so a hotel in an outer suburb may need the city naming explicitly.";
+    }
+    throw err;
+  }
+  return {
+    type: "HTL",
+    reference: hotelNameValue || seg.creditor || "Hotel",
+    confirmationNumber: seg.confirmationNumber || null,
+    confirmationField: refField, // which selector actually took it (null = none found)
+  };
 }
 
 /* ── Ticket costing (costs a flight so it becomes receiptable) ──────────── */
@@ -569,6 +699,14 @@ async function pickCreditor(page, selector, value) {
 // (server) catches this, PAUSES the run, asks the user for the creditor, and
 // re-runs with their answer — instead of skipping (which then fails Tramada's
 // required "Creditor Name must be entered") or guessing.
+function makeNeedsCity(tried, suburb) {
+  const e = new Error(
+    `Tramada City Code: none of ${tried.join(", ")} matched a listed city.`
+  );
+  e.needsCity = { tried, suburb: suburb || "" };
+  return e;
+}
+
 function makeNeedsCreditor(kind, supplierName) {
   const e = new Error(`Creditor needed for ${kind}${supplierName ? ` "${supplierName}"` : ""}.`);
   e.needsCreditor = { kind, supplierName: supplierName || "" };
@@ -820,6 +958,65 @@ async function runReadBookingState({ username, password, bookingNo, callbacks = 
   });
 }
 
+/**
+ * Just the booking's client — one page load, no segments/costings/receipts.
+ * The Room-Res quote flow needs this BEFORE it can create the Room-Res draft
+ * (the portal wants guest names up front), and it only needs the name, so
+ * runReadBookingState's four page loads would be three too many.
+ */
+async function runReadBookingClient({ username, password, bookingNo, callbacks = {} } = {}) {
+  if (!bookingNo) throw new Error("bookingNo required");
+  return await withPage({ username, password, callbacks }, async (page) => {
+    const header = await readBookingHeader(page, bookingNo);
+    // Same trip to Tramada also collects the traveller's mobile, which Room-Res
+    // needs before it will build the draft (§6c). Non-fatal if absent.
+    const contactPhone = await readPassengerMobile(page, bookingNo).catch(() => "");
+    return {
+      bookingNo: String(bookingNo),
+      clientCode: header.client || "",
+      clientName: header.clientName || header.client || "",
+      contactPhone,
+    };
+  });
+}
+
+/**
+ * The lead passenger's mobile number.
+ *
+ * Room-Res provider 19 refuses its booking form without a guest contact number
+ * (roomres-field-map.md §6c), and that number must be the traveller's own — we
+ * never invent one for a form that reaches a real hotel. It lives on the
+ * passenger record as `input[name="mobile"]` ("Mobile No"); the booking summary
+ * doesn't carry it and the client summary only renders it as text.
+ *
+ * Deliberately non-fatal: a booking with no passenger yet, or a passenger with
+ * no number on file, returns "" and the caller decides what to do about it.
+ */
+async function readPassengerMobile(page, bookingNo) {
+  await page.goto(
+    `${TRAMADA_BASE_URL}/booking/booking-passengers.htm?mode=edit&id=${encodeURIComponent(bookingNo)}`,
+    { waitUntil: "domcontentloaded" }
+  );
+  await sleep(500);
+
+  // The list links each passenger by row; there is no id we can guess, so
+  // follow the first booking-passenger.htm link the page offers.
+  const href = await page.evaluate(() => {
+    const a = Array.from(document.querySelectorAll("a")).find((x) =>
+      /booking-passenger\.htm/i.test(x.getAttribute("href") || "")
+    );
+    return a ? a.getAttribute("href") : "";
+  });
+  if (!href) return "";
+
+  await page.goto(new URL(href, TRAMADA_BASE_URL).toString(), { waitUntil: "domcontentloaded" });
+  await sleep(500);
+  return await page.evaluate(() => {
+    const el = document.querySelector('input[name="mobile"]');
+    return el ? String(el.value || "").trim() : "";
+  });
+}
+
 /* ── Passenger (REQUIRED before hotel segments and costings) ───────────── */
 
 /**
@@ -836,7 +1033,10 @@ async function addPassenger(page, bookingNo, { source = "This Client" } = {}) {
 
   // Idempotent: if the booking already has a passenger (e.g. resuming an
   // existing booking), don't add a duplicate.
-  const hasPassenger = await page.evaluate(() => !/No records found/i.test(document.body.innerText));
+  // Same null-body hazard as readSaveErrors: guard it rather than assume.
+  const hasPassenger = await page.evaluate(
+    () => !!document.body && !/No records found/i.test(document.body.innerText || "")
+  );
   if (hasPassenger) return { source, skipped: true };
   await selectIf(page, "#passengerSourceSelect", source); // "This Client" => THIS_CLIENT
   await sleep(300);
@@ -858,6 +1058,82 @@ async function runAddPassenger({ username, password, bookingNo, source, callback
   return await withPage({ username, password, callbacks }, (page) =>
     addPassenger(page, bookingNo, { source })
   );
+}
+
+/* ── Client lookup (read-only) ─────────────────────────────────────────── */
+
+// In-page enumerator for the client autocomplete's dropdown. Same dropdown-zone
+// geometry as _findSuggestion (directly below the input, same column) — without
+// it, unrelated page text gets scraped as "matches".
+function _listSuggestions(sel) {
+  const input = document.querySelector(sel);
+  if (!input) return [];
+  const ir = input.getBoundingClientRect();
+  const seen = new Set();
+  const out = [];
+  for (const n of document.querySelectorAll("li, div, td, a")) {
+    if (n.offsetParent === null) continue;
+    const t = (n.textContent || "").trim();
+    if (!t || t.length > 80) continue;
+    const r = n.getBoundingClientRect();
+    if (!r.width || !r.height) continue;
+    const below = r.top >= ir.bottom - 4 && r.top <= ir.bottom + 340;
+    const overlap = r.left < ir.right + 80 && r.right > ir.left - 80;
+    if (!below || !overlap) continue;
+    // Leaf-ish nodes only: a wrapper div repeats its children's text.
+    if (n.querySelector("li, a")) continue;
+    if (seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * Search Tramada clients by surname and return the autocomplete's own matches.
+ *
+ * Read-only: it opens the ADD-booking form purely to borrow its client
+ * autocomplete, types, reads the dropdown, and never saves. This backs the
+ * agreed new-booking flow — the user types a surname, we show what Tramada
+ * actually has, the user picks one — rather than us guessing a client code.
+ */
+async function readClientMatches(page, surname) {
+  const want = String(surname || "").trim();
+  if (!want) return [];
+  await page.goto(`${TRAMADA_BASE_URL}/booking/booking-profile.htm?mode=ADD`, { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#client", { timeout: 15000 });
+
+  const input = page.locator("#client").first();
+  await input.click();
+  await input.fill("");
+  await input.type(want, { delay: 70 }); // real keystrokes — the widget ignores fill()
+
+  // Poll until the list stops changing (it reflows while rendering).
+  let prev = "";
+  let stable = [];
+  for (let i = 0; i < 20; i++) {
+    await sleep(350);
+    const cur = await page.evaluate(_listSuggestions, "#client").catch(() => []);
+    const key = cur.join("|");
+    if (cur.length && key === prev) { stable = cur; break; }
+    prev = key;
+    stable = cur;
+  }
+
+  const typedUpper = want.toUpperCase();
+  return stable
+    .filter((t) => t.toUpperCase() !== typedUpper) // drop the input's own echo
+    .map((t) => ({ label: t, clientCode: (t.split(/\s{2,}|\s+-\s+/)[0] || t).trim() }));
+}
+
+async function runSearchClients({ username, password, surname, callbacks = {} }) {
+  const onProgress = callbacks.onProgress || (() => {});
+  return await withPage({ username, password, callbacks }, async (page) => {
+    onProgress(30, `Searching Tramada clients for "${surname}"...`);
+    const matches = await readClientMatches(page, surname);
+    onProgress(100, matches.length ? `${matches.length} client match(es).` : `No client matched "${surname}".`);
+    return matches;
+  });
 }
 
 /* ── Standalone runners (open their own page over CDP) ─────────────────── */
@@ -1285,7 +1561,10 @@ module.exports = {
   runFullBooking,
   runPdfBooking,
   runReadBookingState,
+  runReadBookingClient,
   runAddPassenger,
+  runSearchClients,
+  readClientMatches,
   runAddSegments,
   runAddCostings,
   runAddCostingLines,
@@ -1300,7 +1579,10 @@ module.exports = {
   readCostings,
   readItinerary,
   readBookingHeader,
+  readPassengerMobile,
   readReceiptsList,
+  setConfirmationRef,
+  CONFIRMATION_REF_SELECTORS,
   toTramadaDate,
   toFlightNumber,
   toClassCode,

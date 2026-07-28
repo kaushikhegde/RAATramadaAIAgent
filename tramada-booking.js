@@ -82,6 +82,15 @@ function mapJetstarToTramada(booking, clientCode) {
   // Cap at 250 chars — Tramada's text fields are roughly that wide.
   const itinerarySummary = truncate(baseSegments.join(" • "), 250);
 
+  // Non-flight sources (e.g. a Room-Res hotel quote) have no origin/destination
+  // airports, so the derived values above read as nonsense for them. They pass
+  // `tramadaOverrides` with the header fields they can state correctly, and only
+  // those are replaced. Purely additive: the Jetstar path never sets it.
+  const overrides = {};
+  for (const [k, v] of Object.entries(booking.tramadaOverrides || {})) {
+    if (v !== undefined && v !== null) overrides[k] = v;
+  }
+
   return {
     clientCode,
     departureDate: toTramadaDate(booking.departureDate),
@@ -97,6 +106,7 @@ function mapJetstarToTramada(booking, clientCode) {
     cabinClass: "ECON",
     itinerary: itinerarySummary,
     primaryDest: dest,
+    ...overrides,
   };
 }
 
