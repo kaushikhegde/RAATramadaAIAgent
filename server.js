@@ -30,9 +30,10 @@ const { parseRaaItineraryBuffer } = require("./pdf-itinerary");
 const { runRoomResDraft, runRoomResQuote, closeRoomResPage } = require("./room-res-quote");
 const { runRoomResToTramada, findTramadaClients, lookupBookingClient } = require("./room-res-tramada");
 const roomResChat = require("./roomres-chat");
+const { readCreditorPayment } = require("./tramada-payment");
 
 // ─── Config ──────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const DEBUG = process.env.DEBUG === "true";
 // Skip the Jetstar browser automation and go straight from chat → Tramada.
@@ -41,6 +42,29 @@ const SKIP_JETSTAR = process.env.SKIP_JETSTAR === "true";
 // Full "from the top" mode: chat collects booking→segments→costing→receipt and
 // the assistant runs the whole Tramada pipeline (tramada-segments.runFullBooking).
 const PIPELINE_MODE = process.env.PIPELINE_MODE === "true";
+
+// ─── Tabs ────────────────────────────────────────────────────────
+// These two flags used to be read once at start-up, which is why switching
+// between the Jetstar flow and the Tramada assistant meant restarting with a
+// different npm script. They are now per-CONNECTION: each browser tab opens its
+// own WebSocket carrying ?mode=, gets its own session, its own Gemini prompt and
+// its own history, so all three run side by side in one server.
+//
+// The env vars survive as the DEFAULT for a socket that names no mode, so the
+// existing npm scripts keep working exactly as they do today.
+const MODES = {
+  flights:  { pipeline: false, skipJetstar: false },
+  tramada:  { pipeline: true,  skipJetstar: true  },
+  // Payments is a structured flow, not a conversation: booking number in,
+  // scrape, confirm, stage with Mint. It runs neither of the Gemini prompts.
+  payments: { pipeline: false, skipJetstar: true,  noGemini: true },
+};
+
+const DEFAULT_MODE = PIPELINE_MODE ? "tramada" : "flights";
+
+function resolveMode(requested) {
+  return MODES[requested] ? requested : DEFAULT_MODE;
+}
 
 function log(...args) {
   if (DEBUG) console.log("[server]", ...args);
@@ -82,9 +106,11 @@ const server = http.createServer(app);
 // ─── WebSocket server ────────────────────────────────────────────
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-wss.on("connection", (ws) => {
-  console.log("🔌 Client connected");
-  const session = createSession(ws);
+wss.on("connection", (ws, req) => {
+  const requested = new URL(req.url, "http://localhost").searchParams.get("mode");
+  const mode = resolveMode(requested);
+  console.log(`🔌 Client connected (${mode} tab)`);
+  const session = createSession(ws, mode);
 
   ws.on("message", (raw) => {
     try {
@@ -101,7 +127,12 @@ wss.on("connection", (ws) => {
   });
 
   // Send welcome message
-  if (PIPELINE_MODE) {
+  if (session.mode === "payments") {
+    sendToClient(ws, {
+      type: "bot_message",
+      text: "Creditor payments via MINT. Give me a booking number and I'll read the payment details out of Tramada, then stage the payment for you to authorise in Mint.",
+    });
+  } else if (session.pipelineMode) {
     sendToClient(ws, {
       type: "bot_message",
       text: "Hi — I can create a new booking in Tramada, open an existing one to add segments, costings or receipts, or take an RAA itinerary PDF and build it out for you (segments, costings and the EFT receipt). Pick an option below, or use the 📎 button to upload a PDF.",
@@ -110,7 +141,7 @@ wss.on("connection", (ws) => {
   } else {
     sendToClient(ws, {
       type: "bot_message",
-      text: SKIP_JETSTAR
+      text: session.skipJetstar
         ? "G'day! ✈️ I'm your travel booking assistant. Tell me the trip details and I'll record the booking in Tramada — or upload a booking PDF if you have one ready!"
         : "G'day! ✈️ I'm your Jetstar booking assistant. I can help you find and book flights on Jetstar. Just tell me where you'd like to go, or upload a booking PDF if you have one ready!",
       quickReplies: ["Book a flight", "Upload PDF"],
@@ -119,31 +150,40 @@ wss.on("connection", (ws) => {
 });
 
 // ─── Session management ──────────────────────────────────────────
-function createSession(ws) {
+function createSession(ws, mode = DEFAULT_MODE) {
+  const cfg = MODES[mode] || MODES[DEFAULT_MODE];
   return {
     ws,
     active: true,
+    mode,                      // "flights" | "tramada" | "payments"
+    pipelineMode: cfg.pipeline,
+    skipJetstar: cfg.skipJetstar,
     chatHistory: [],          // Gemini conversation history
     bookingData: null,        // Extracted booking JSON
     automationRunning: false,
     geminiChat: null,         // Gemini chat session
     roomRes: null,            // Room-Res quote conversation (roomres-chat.js state)
     roomResPending: null,      // that flow paused on a question only the user can answer (creditor / city)
+    pendingPayment: null,      // payments tab paused on a supplier choice
   };
 }
 
 // ─── Gemini AI setup ─────────────────────────────────────────────
-function getGeminiChat() {
+function getGeminiChat(session) {
   if (!GEMINI_API_KEY || GEMINI_API_KEY === "your-gemini-api-key-here") {
     return null;
   }
+  // Fall back to the module defaults when called without a session, so any
+  // caller added later behaves as it did before tabs existed.
+  const pipeline = session ? session.pipelineMode : PIPELINE_MODE;
+  const skipJetstar = session ? session.skipJetstar : SKIP_JETSTAR;
 
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
   const model = genAI.getGenerativeModel({
-    model: "gemini-2.5-flash",
-    systemInstruction: PIPELINE_MODE
+    model: "gemini-3.5-flash-lite",
+    systemInstruction: pipeline
       ? buildAssistantPrompt()
-      : buildSystemPrompt({ skipJetstar: SKIP_JETSTAR }),
+      : buildSystemPrompt({ skipJetstar }),
   });
 
   return model.startChat({
@@ -217,12 +257,264 @@ async function handleClientMessage(session, msg) {
   }
 }
 
+// ─── Payments tab (MINT creditor payments) ───────────────────────
+// Steps 1–6 of docs/Payments_Guide_MINT.md. Reads only: it opens the booking,
+// sets EFT, picks the supplier and reads Segments to Allocate, then shows the
+// consultant what it found. Nothing is sent to Mint and nothing is issued in
+// Tramada until they confirm — the confirmation is where the Tramada→Mint
+// MAPPING is visible, which is the one thing Mint's own screen cannot show.
+
+function extractBookingNo(text) {
+  const m = String(text || "").match(/\b(\d{4,7})\b/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Yes / no / neither, for the confirmation that stands in front of the payment.
+ *
+ * Returns `null` for anything it does not recognise, and the caller re-asks.
+ * Unclear must never fall through to yes: this is the last gate before a
+ * consultant is sent to MintEFT to move real money, and a loose /yes|y/ test
+ * matches the "y" in "why?" and the "no" branch never runs at all.
+ */
+function readYesNo(text) {
+  const t = String(text || "").trim().toLowerCase().replace(/[.!]+$/, "");
+  if (/^(y|yes|yep|yeah|ok|okay|sure|continue|proceed|go ahead)$/.test(t)) return "yes";
+  if (/^(n|no|nope|nah|not now|cancel|stop)$/.test(t)) return "no";
+  return null;
+}
+
+/**
+ * Step 9's field mapping, and the full stop at step 10.
+ *
+ * BR02 — the agent never makes the payment on Mint; a human does. What it can
+ * do is name which MintEFT box each Tramada value goes in, which is the one
+ * thing Mint's own screen cannot show: over there the consultant is looking at
+ * empty fields with nothing to say what Tramada called any of them.
+ */
+function sendMintHandover(session, p) {
+  const { ws } = session;
+  const money = (n) => (n == null ? "&mdash;" : "$" + Number(n).toFixed(2));
+
+  // BR01 — no reference number is a hand-off to a human, not a stop. The rest
+  // of the mapping is still worth showing; the missing field is called out.
+  const reference = (p.segments || []).map((s) => s.reference).filter(Boolean)[0] || null;
+  const lastName = String(p.clientName || "").trim().split(/\s+/).pop() || "&mdash;";
+
+  const rows = [
+    ["Recipient Reference", reference || "<i>no reference on the segment &mdash; BR01, raise it with a human</i>"],
+    ["Sender Reference", p.bookingNo],
+    ["Passenger Name", lastName],
+    ["Total Amount", money(p.total)],
+    ["Payment Date", "today"],
+    ["Payee Name or Number", p.supplier || "&mdash;"],
+  ]
+    .map(([k, v]) => `<b>${k}</b> &rarr; ${v}`)
+    .join("<br>");
+
+  sendToClient(ws, {
+    type: "bot_message",
+    text:
+      `Here is booking <b>${p.bookingNo}</b> mapped onto MintEFT's New Payment form:<br><br>${rows}<br><br>` +
+      `<b>The payment is yours to make</b> — I don't touch Mint. Create it there and press Confirm; ` +
+      `the <b>M00\u2026</b> transaction id it gives back is what goes into Tramada's Reference field (step 12).`,
+  });
+}
+
+async function handlePaymentsMessage(session, userText) {
+  const { ws } = session;
+  const text = String(userText || "").trim();
+
+  if (/^(cancel|stop|reset|start over)$/i.test(text)) {
+    session.pendingPayment = null;
+    sendToClient(ws, { type: "bot_message", text: "Cleared. Give me a booking number when you're ready." });
+    return;
+  }
+
+  // Awaiting the Yes/No in front of the payment. Handled before anything else
+  // reads this message, so a bare "no" here is a no to THIS question and not a
+  // booking number that failed to parse.
+  if (session.pendingPayment && session.pendingPayment.awaitingConfirm) {
+    const pending = session.pendingPayment;
+    const answer = readYesNo(text);
+
+    // A booking number typed at the prompt means "a different booking" — take
+    // it rather than making them cancel first and type it twice.
+    const other = answer ? null : extractBookingNo(text);
+    if (other) {
+      session.pendingPayment = null;
+      await runPaymentRead(session, other, null);
+      return;
+    }
+
+    if (answer === "no") {
+      session.pendingPayment = null;
+      sendToClient(ws, {
+        type: "bot_message",
+        text:
+          `Stopped there — nothing went to Mint and nothing was issued in Tramada for booking ` +
+          `<b>${pending.bookingNo}</b>. Send me another booking number when you're ready.`,
+      });
+      return;
+    }
+
+    if (answer !== "yes") {
+      sendToClient(ws, {
+        type: "bot_message",
+        text: `Sorry — I need a yes or a no on booking <b>${pending.bookingNo}</b>.`,
+        quickReplies: ["Yes", "No"],
+      });
+      return;
+    }
+
+    session.pendingPayment = null;
+    sendMintHandover(session, pending.payment);
+    return;
+  }
+
+  // Awaiting a supplier choice from a multi-creditor booking.
+  if (session.pendingPayment && session.pendingPayment.awaitingSupplier) {
+    const { bookingNo, suppliers } = session.pendingPayment;
+    const byIndex = /^\d+$/.test(text) ? suppliers[Number(text) - 1] : null;
+    const chosen =
+      byIndex ||
+      suppliers.find((o) => o.text.toLowerCase() === text.toLowerCase()) ||
+      suppliers.find((o) => o.text.toLowerCase().includes(text.toLowerCase()));
+
+    if (!chosen) {
+      sendToClient(ws, {
+        type: "bot_message",
+        text: `I couldn't match "${text}" to a supplier on booking ${bookingNo}. Reply with the number from the list, or the supplier name.`,
+      });
+      return;
+    }
+    session.pendingPayment = null;
+    await runPaymentRead(session, bookingNo, chosen.text);
+    return;
+  }
+
+  const bookingNo = extractBookingNo(text);
+  if (!bookingNo) {
+    sendToClient(ws, {
+      type: "bot_message",
+      text: "Give me a booking number (e.g. <b>13061</b>) and I'll read the creditor payment out of Tramada.",
+    });
+    return;
+  }
+
+  await runPaymentRead(session, bookingNo, null);
+}
+
+let paymentReadSeq = 0;
+
+async function runPaymentRead(session, bookingNo, supplier) {
+  const { ws } = session;
+
+  if (session.automationRunning) {
+    sendToClient(ws, { type: "bot_message", text: "Already reading a booking — give that one a moment." });
+    return;
+  }
+  session.automationRunning = true;
+
+  // Every read carries its own id so the page draws it a NEW progress card.
+  // A second booking number used to be typed into the first one's card, which
+  // overwrote how far the failed attempt actually got — the one thing worth
+  // reading after a booking comes back not found.
+  const runId = `pay-${Date.now().toString(36)}-${++paymentReadSeq}`;
+
+  sendToClient(ws, {
+    type: "bot_message",
+    text: `Reading booking <b>${bookingNo}</b> in Tramada${supplier ? ` for <b>${supplier}</b>` : ""}…`,
+  });
+
+  try {
+    const result = await readCreditorPayment({
+      bookingNo,
+      supplier,
+      callbacks: {
+        onProgress: (pct, m) =>
+          session.active && sendToClient(ws, { type: "pipeline_progress", runId, percent: pct, message: m }),
+        onNeedLogin: () =>
+          sendToClient(ws, {
+            type: "bot_message",
+            text: "Tramada needs a login — sign in to the shared Chrome window, then send the booking number again.",
+          }),
+      },
+    });
+
+    // More than one creditor means more than one payment: one Mint transaction
+    // and one human authorisation each. Ask rather than guess — paying the right
+    // amount to the wrong supplier has no automated recovery.
+    if (result.needsSupplierChoice) {
+      session.pendingPayment = { bookingNo, awaitingSupplier: true, suppliers: result.suppliers };
+      const list = result.suppliers.map((o, i) => `${i + 1}. ${o.text}`).join("<br>");
+      sendToClient(ws, {
+        type: "bot_message",
+        text:
+          `Booking <b>${bookingNo}</b> (${result.clientName || "client unknown"}) has ${result.suppliers.length} creditors. ` +
+          `Each is its own payment. Which one are we paying?<br><br>${list}`,
+      });
+      return;
+    }
+
+    sendToClient(ws, { type: "payment_summary", payment: result });
+
+    if (!result.segmentsFound || result.segments.length === 0) {
+      session.pendingPayment = null;
+      sendToClient(ws, {
+        type: "bot_message",
+        text:
+          `Nothing to allocate on booking <b>${bookingNo}</b> — the Segments to Allocate table is empty, ` +
+          `so there's no creditor payable here. Send me another booking number.`,
+      });
+      return;
+    }
+
+    // Found, and there is something to pay. The only question left is whether
+    // to carry on, and it is asked with buttons rather than taken off free
+    // text: this is the last gate before a consultant is sent to MintEFT, and
+    // a typed answer is where "no, don't" gets read as a yes.
+    session.pendingPayment = { bookingNo, awaitingConfirm: true, payment: result };
+    sendToClient(ws, {
+      type: "bot_message",
+      text:
+        `Booking <b>${bookingNo}</b> found — ${result.supplier ? `<b>${result.supplier}</b>, ` : ""}` +
+        `<b>$${Number(result.total || 0).toFixed(2)}</b> across ${result.segments.length} ` +
+        `segment${result.segments.length === 1 ? "" : "s"}.<br><br>Continue with making the payment?`,
+      quickReplies: ["Yes", "No"],
+    });
+  } catch (err) {
+    // A booking that isn't there is the consultant's to fix, not a fault — so
+    // it reads as a plain answer and asks for another number, rather than as
+    // the automation falling over. Everything else is still an error.
+    if (err.code === "BOOKING_NOT_FOUND") {
+      session.pendingPayment = null;
+      sendToClient(ws, {
+        type: "bot_message",
+        text: `Booking <b>${bookingNo}</b> could not be found in Tramada. Check the number and send me another one.`,
+      });
+    } else {
+      sendToClient(ws, { type: "error", text: `Tramada read failed: ${err.message}` });
+    }
+  } finally {
+    session.automationRunning = false;
+  }
+}
+
 // ─── Process user text messages through Gemini ───────────────────
 async function handleUserMessage(session, userText) {
   const { ws } = session;
 
   // Show typing indicator
   sendToClient(ws, { type: "typing" });
+
+  // ── Payments tab ──
+  // Owns its messages outright: a bare booking number here means "read this
+  // booking's creditor payment", not something for the booking assistant.
+  if (session.mode === "payments") {
+    await handlePaymentsMessage(session, userText);
+    return;
+  }
 
   // ── Room-Res quote flow ──
   // Ahead of everything else, and deliberately outside the PIPELINE_MODE gate:
@@ -261,7 +553,7 @@ async function handleUserMessage(session, userText) {
   }
 
   // ── Pipeline mode: run the whole booking→segments→costing→receipt chain ──
-  if (PIPELINE_MODE) {
+  if (session.pipelineMode) {
     // Awaiting a creditor the run PAUSED on — take this reply as the creditor
     // name, apply it, and resume the run from where it stopped.
     if (session.pendingCreditor) {
@@ -310,7 +602,7 @@ async function handleUserMessage(session, userText) {
     session.bookingData &&
     /yes.*book|confirm|let'?s? go|book it|proceed|start booking/i.test(userText)
   ) {
-    if (SKIP_JETSTAR) {
+    if (session.skipJetstar) {
       sendToClient(ws, {
         type: "bot_message",
         text: "Beauty! Let's get this straight into Tramada.",
@@ -341,14 +633,14 @@ async function handleUserMessage(session, userText) {
   try {
     // Initialize chat if needed
     if (!session.geminiChat) {
-      session.geminiChat = getGeminiChat();
+      session.geminiChat = getGeminiChat(session);
     }
 
     // Send user message to Gemini. If a PDF was uploaded this session, prepend
     // its context so follow-up questions ("what's in the PDF", "use it for X")
     // are understood instead of getting a blank greeting.
     let toSend = userText;
-    if (PIPELINE_MODE && session.lastPdf) {
+    if (session.pipelineMode && session.lastPdf) {
       const p = session.lastPdf;
       const segs = (p.segments || []).map((s) => `${s.kind} ${s.supplierName || ""}`.trim()).join("; ");
       const costs = (p.costingLines || []).map((c) => `${c.kind} ${c.supplierName || c.description || ""}`.trim()).join("; ");
@@ -364,7 +656,7 @@ async function handleUserMessage(session, userText) {
 
     // Assistant mode: handle intents (list_bookings / open_booking / run) with
     // results fed back to the model as [SYSTEM] messages, up to 3 hops.
-    if (PIPELINE_MODE) {
+    if (session.pipelineMode) {
       await handleAssistantResponse(session, response, 0);
       return;
     }
@@ -1020,7 +1312,7 @@ async function handleTramadaChain(session, username, password, clientCode) {
   if (!booking || !booking.departureDate) {
     sendToClient(ws, {
       type: "error",
-      text: SKIP_JETSTAR
+      text: session.skipJetstar
         ? "No booking details in session yet — tell me your trip details first."
         : "No Jetstar itinerary in session yet — run the booking first.",
     });

@@ -117,7 +117,19 @@ async function tramadaIsAuthed(page) {
   await page
     .goto(`${TRAMADA_BASE_URL}/home/home.htm`, { waitUntil: "domcontentloaded" })
     .catch(() => {});
-  return !page.url().includes("login.htm");
+
+  if (page.url().includes("login.htm")) return false;
+
+  // The URL alone is not enough: this tenant SERVES the login page at
+  // home.htm without redirecting, so a logged-out session used to pass this
+  // check and fail much later with a misleading "booking could not be opened".
+  // Look at what actually rendered.
+  return await page
+    .evaluate(() => {
+      if (/login/i.test(document.title)) return false;
+      return !document.querySelector('#loginForm_password, input[type="password"]');
+    })
+    .catch(() => true);
 }
 
 async function ensureLoggedIn(page, { username, password, onNeedLogin } = {}) {
@@ -277,7 +289,9 @@ async function getBookingDetails(page, bookingNo) {
       clientName,
       // Payer Name always = booking client name (business rule)
       payerName: clientName,
-      debtor: grab("Debtor"),
+      // (?!s) so this doesn't match the "Debtors" nav-menu link, which
+      // appears earlier in body.innerText than the real "Debtor:" field.
+      debtor: grab("Debtor(?!s)"),
       itinerary: grab("Itinerary"),
       bookDate: grab("Book\\.? Date"),
       depDate: grab("Dep\\.? Date"),
@@ -286,7 +300,14 @@ async function getBookingDetails(page, bookingNo) {
 
   const loaded = !page.url().includes("booking-search") && !!details.bookingNo;
   if (!loaded) {
-    throw new Error(`Booking ${bookingNo} could not be opened.`);
+    // Coded, because this is the one failure here that is the consultant's to
+    // fix rather than a fault: a mistyped booking number has to read as "that
+    // booking isn't in Tramada", not as the automation falling over. Callers
+    // that don't look at `code` still get a sentence they can show as-is.
+    const err = new Error(`Booking ${bookingNo} could not be found in Tramada.`);
+    err.code = "BOOKING_NOT_FOUND";
+    err.bookingNo = String(bookingNo);
+    throw err;
   }
   return details;
 }
@@ -793,4 +814,12 @@ module.exports = {
   toTramadaDate,
   resolveTxnType,
   TXN_TYPE,
+  // Shared browser/session plumbing. The creditor-payment flow (MINT) needs the
+  // same CDP connection and the same login handling as receipting, and there is
+  // no reason for a second copy of either.
+  openBrowser,
+  ensureLoggedIn,
+  setFieldWithEvents,
+  getBookingDetails,
+  TRAMADA_BASE_URL,
 };

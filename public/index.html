@@ -143,6 +143,80 @@
     min-height: 0;
   }
 
+  .payment-segments {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+    font-size: 12px;
+  }
+  .payment-segments th {
+    text-align: left;
+    font-weight: 600;
+    color: var(--raa-text-light);
+    border-bottom: 1px solid var(--raa-grey-border);
+    padding: 4px 6px;
+  }
+  .payment-segments td {
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--raa-warm-grey);
+  }
+
+  /* ── Tabs ── */
+  /* One tab per flow. Each opens its own WebSocket with ?mode=, so the three
+     run side by side instead of needing a server restart to switch between
+     them the way the npm scripts used to. */
+  .tab-bar {
+    display: flex;
+    gap: 2px;
+    background: var(--raa-white);
+    border-bottom: 1px solid var(--raa-grey-border);
+    padding: 0 16px;
+    flex-shrink: 0;
+  }
+  .tab-btn {
+    appearance: none;
+    border: none;
+    background: transparent;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--raa-text-light);
+    padding: 11px 18px 9px;
+    cursor: pointer;
+    border-bottom: 3px solid transparent;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    transition: color .15s ease, background .15s ease;
+  }
+  .tab-btn:hover { color: var(--raa-text); background: var(--raa-light-bg); }
+  .tab-btn.active { color: var(--raa-text); border-bottom-color: var(--raa-yellow); }
+  .tab-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--raa-grey-border);
+    transition: background .2s ease;
+  }
+  .tab-btn.online .tab-dot { background: #2E9E5B; }
+  .tab-hint { font-weight: 500; font-size: 11px; color: var(--raa-text-light); opacity: .8; }
+
+  /* Two/three classes on purpose: `.chat-panel { display: flex }` is defined
+     below and would otherwise win on source order, showing all three panes at
+     once. Specificity keeps only the clicked tab visible. */
+  .chat-panel.tab-pane { display: none; }
+  .chat-panel.tab-pane.active { display: flex; }
+
+  /* Mock-mode warning. Loud on purpose: nobody should watch a payment demo and
+     believe money moved. */
+  .mint-banner {
+    background: #FFF4C2;
+    border-bottom: 1px solid #E8D77A;
+    color: #6B5800;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 7px 16px;
+    flex-shrink: 0;
+  }
+
   /* ── Chat panel (left) ── */
   .chat-panel {
     flex: 1;
@@ -676,17 +750,44 @@
   </div>
 </div>
 
+<div class="tab-bar" id="tabBar">
+  <button class="tab-btn active" data-tab="flights"  onclick="switchTab('flights')"><span class="tab-dot"></span>Flights<span class="tab-hint">Jetstar &rarr; Tramada</span></button>
+  <button class="tab-btn"        data-tab="tramada"  onclick="switchTab('tramada')"><span class="tab-dot"></span>Tramada<span class="tab-hint">Bookings, segments, receipts</span></button>
+  <button class="tab-btn"        data-tab="payments" onclick="switchTab('payments')"><span class="tab-dot"></span>Payments<span class="tab-hint">MINT creditor payments</span></button>
+</div>
+
 <div class="main-content">
-  <!-- Left: Chat -->
-  <div class="chat-panel" id="chatPanel">
-    <div class="chat-container" id="chatContainer"></div>
+  <!-- Flights: Jetstar search + book, then Tramada -->
+  <div class="chat-panel tab-pane active" id="pane-flights">
+    <div class="chat-container" id="chatContainer-flights"></div>
+    <div class="input-area">
+      <input type="text" id="userInput-flights" placeholder="Where would you like to go?"
+             onkeydown="if(event.key==='Enter' && !event.shiftKey) sendMessage()">
+      <button class="send-btn" id="sendBtn-flights" onclick="sendMessage()">&#10148;</button>
+    </div>
+  </div>
+
+  <!-- Tramada: bookings, segments, costings, receipts, PDF, Room-Res -->
+  <div class="chat-panel tab-pane" id="pane-tramada">
+    <div class="chat-container" id="chatContainer-tramada"></div>
     <div class="input-area">
       <input type="file" id="pdfInput" accept=".pdf">
       <button class="upload-btn" onclick="document.getElementById('pdfInput').click()" title="Upload an RAA itinerary PDF">&#128206; Itinerary PDF</button>
       <button class="upload-btn quote-btn" onclick="startRoomResQuote()" title="Room-Res hotel quote, then the Tramada segment and receipt">&#127976; Create Quote</button>
-      <input type="text" id="userInput" placeholder="Type a message..."
+      <input type="text" id="userInput-tramada" placeholder="Type a message..."
              onkeydown="if(event.key==='Enter' && !event.shiftKey) sendMessage()">
-      <button class="send-btn" id="sendBtn" onclick="sendMessage()">&#10148;</button>
+      <button class="send-btn" id="sendBtn-tramada" onclick="sendMessage()">&#10148;</button>
+    </div>
+  </div>
+
+  <!-- Payments: Tramada creditor payment staged with MINT -->
+  <div class="chat-panel tab-pane" id="pane-payments">
+    <div class="mint-banner" id="mintBanner" style="display:none;"></div>
+    <div class="chat-container" id="chatContainer-payments"></div>
+    <div class="input-area">
+      <input type="text" id="userInput-payments" placeholder="Booking number (e.g. 13061)&hellip;"
+             onkeydown="if(event.key==='Enter' && !event.shiftKey) sendMessage()">
+      <button class="send-btn" id="sendBtn-payments" onclick="sendMessage()">&#10148;</button>
     </div>
   </div>
 
@@ -719,21 +820,78 @@
 </div>
 
 <script>
-  const chatContainer = document.getElementById('chatContainer');
-  const userInput = document.getElementById('userInput');
-  const sendBtn = document.getElementById('sendBtn');
   const statusBadge = document.getElementById('statusBadge');
   const pdfInput = document.getElementById('pdfInput');
-  const chatPanel = document.getElementById('chatPanel');
   const browserPanel = document.getElementById('browserPanel');
   const browserContent = document.getElementById('browserContent');
   const browserPlaceholder = document.getElementById('browserPlaceholder');
   const browserToggle = document.getElementById('browserToggle');
 
-  let ws = null;
-  let isProcessing = false;
   let browserVisible = false;
   let browserLoaded = false;
+
+  // ── Tabs ──────────────────────────────────────────────────────────────
+  // Each tab is a full, independent chat: its own socket, its own transcript,
+  // its own in-flight state. The rest of this file still says `ws`,
+  // `chatContainer`, `userInput`, `sendBtn` and `isProcessing` — those names are
+  // now accessors that resolve to whichever tab is being rendered, so none of
+  // the existing rendering or send code had to change.
+  const TAB_IDS = ['flights', 'tramada', 'payments'];
+
+  const tabs = {};
+  for (const id of TAB_IDS) {
+    tabs[id] = {
+      id,
+      ws: null,
+      isProcessing: false,
+      pane: document.getElementById('pane-' + id),
+      container: document.getElementById('chatContainer-' + id),
+      input: document.getElementById('userInput-' + id),
+      send: document.getElementById('sendBtn-' + id),
+      btn: document.querySelector(`.tab-btn[data-tab="${id}"]`),
+      // The progress card currently being written to in THIS transcript, and
+      // the run it belongs to. See updateTramadaProgress.
+      progressCard: null,
+      progressRunId: null,
+    };
+  }
+
+  let activeTab = 'flights';
+  // Which tab the code below is currently acting on. Equals activeTab for
+  // anything the user just did; set to the originating tab while a background
+  // socket's message is rendered, so its output lands in ITS transcript and not
+  // in whichever tab happens to be on screen.
+  let renderTab = 'flights';
+
+  const bind = (name, get, set) =>
+    Object.defineProperty(window, name, { get, set, configurable: true });
+
+  bind('ws',             () => tabs[renderTab].ws,        (v) => { tabs[renderTab].ws = v; });
+  bind('isProcessing',   () => tabs[renderTab].isProcessing, (v) => { tabs[renderTab].isProcessing = v; });
+  bind('chatContainer',  () => tabs[renderTab].container);
+  bind('userInput',      () => tabs[renderTab].input);
+  bind('sendBtn',        () => tabs[renderTab].send);
+  bind('chatPanel',      () => tabs[activeTab].pane);
+
+  function switchTab(id) {
+    if (!tabs[id]) return;
+    activeTab = renderTab = id;
+    for (const t of Object.values(tabs)) {
+      t.pane.classList.toggle('active', t.id === id);
+      t.btn.classList.toggle('active', t.id === id);
+    }
+    // The browser panel belongs to whichever tab is showing.
+    tabs[id].pane.classList.toggle('with-browser', browserVisible);
+    tabs[id].input.focus();
+    scrollToBottom();
+    updateStatusBadge();
+  }
+
+  function updateStatusBadge() {
+    const open = tabs[activeTab].ws && tabs[activeTab].ws.readyState === WebSocket.OPEN;
+    statusBadge.textContent = open ? 'Connected' : 'Disconnected';
+    statusBadge.className = 'status ' + (open ? 'connected' : 'disconnected');
+  }
 
   // ── Browser panel controls ──
   function toggleBrowser() {
@@ -800,30 +958,48 @@
   }
 
   // ── WebSocket ──
-  function connect() {
+  // One socket per tab. The ?mode= tells the server which flow this connection
+  // is: it picks the Gemini prompt and the message routing per session, which is
+  // what used to require restarting with a different npm script.
+  function connect(tabId) {
+    const tab = tabs[tabId];
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${protocol}//${location.host}/ws`);
+    const socket = new WebSocket(`${protocol}//${location.host}/ws?mode=${encodeURIComponent(tabId)}`);
+    tab.ws = socket;
 
-    ws.onopen = () => {
-      statusBadge.textContent = 'Connected';
-      statusBadge.className = 'status connected';
+    socket.onopen = () => {
+      tab.btn.classList.add('online');
+      if (tabId === activeTab) updateStatusBadge();
     };
 
-    ws.onclose = () => {
-      statusBadge.textContent = 'Disconnected';
-      statusBadge.className = 'status disconnected';
-      setTimeout(connect, 3000);
+    socket.onclose = () => {
+      tab.btn.classList.remove('online');
+      if (tabId === activeTab) updateStatusBadge();
+      setTimeout(() => connect(tabId), 3000);
     };
 
-    ws.onerror = () => {
-      statusBadge.textContent = 'Error';
-      statusBadge.className = 'status disconnected';
+    socket.onerror = () => {
+      tab.btn.classList.remove('online');
+      if (tabId === activeTab) updateStatusBadge();
     };
 
-    ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
       const data = JSON.parse(event.data);
-      handleServerMessage(data);
+      // Render into the tab this message came FROM, not the visible one, then
+      // put the pointer back. Rendering is synchronous, so nothing can observe
+      // the swap.
+      const prev = renderTab;
+      renderTab = tabId;
+      try {
+        handleServerMessage(data);
+      } finally {
+        renderTab = prev;
+      }
     };
+  }
+
+  function connectAll() {
+    for (const id of TAB_IDS) connect(id);
   }
 
   function handleServerMessage(data) {
@@ -866,16 +1042,18 @@
       case 'pdf_receipt_preview':
         showPdfReceiptPreview(data);
         break;
+      case 'payment_summary':
+        addPaymentSummary(data.payment);
+        break;
+
       case 'pipeline_progress':
-        updateTramadaProgress(data.percent, data.message);
+        updateTramadaProgress(data.percent, data.message, data.runId);
         break;
       case 'pipeline_stage':
         break; // progress card already reflects stages
-      case 'pipeline_complete': {
-        const pc = document.getElementById('tramadaProgressCard');
-        if (pc) pc.removeAttribute('id'); // freeze card; next run gets a fresh one
+      case 'pipeline_complete':
+        freezeProgressCard(); // next run gets a fresh one
         break;
-      }
       case 'tramada_complete':
         addBotMessage('&#9989; Tramada done.');
         break;
@@ -924,7 +1102,11 @@
 
   function sendQuickReply(text) {
     // A PDF-upload quick reply opens the file picker instead of sending text.
+    // The itinerary flow lives on the Tramada tab, so hop there first — the
+    // picker is the same control either way, but the reply that comes back
+    // belongs in the Tramada transcript.
     if (/upload.*pdf|itinerary pdf/i.test(text)) {
+      if (activeTab !== 'tramada') switchTab('tramada');
       document.getElementById('pdfInput').click();
       return;
     }
@@ -1329,30 +1511,55 @@
     addBotMessage('&#9881; Submitting Tramada chain...');
   };
 
-  function updateTramadaProgress(percent, message) {
-    let card = document.getElementById('tramadaProgressCard');
+  // One live progress card per TAB, and a new card per RUN.
+  //
+  // It was a single card found by a document-wide id, which went wrong twice
+  // over. All three transcripts sit in the DOM at once, so both tabs' cards
+  // answered to that id and a payments run wrote its progress into whichever
+  // card had been created first. And a second booking number, sent after the
+  // first came back not found, was drawn over the top of the first attempt's
+  // card rather than below it — losing how far that attempt actually got,
+  // which is the one thing worth reading afterwards.
+  //
+  // `runId` is what separates one run from the next. Messages that don't carry
+  // one keep the old reuse-this-card behaviour, now scoped to their own tab.
+  function updateTramadaProgress(percent, message, runId) {
+    const tab = tabs[renderTab];
+    let card = tab.progressCard;
+
+    if (card && !card.isConnected) card = null;
+    if (card && runId && tab.progressRunId !== runId) card = null;
+
     if (!card) {
-      const wrapper = document.createElement('div');
-      wrapper.className = 'message bot';
-      wrapper.id = 'tramadaProgressCard';
-      wrapper.innerHTML = `
+      card = document.createElement('div');
+      card.className = 'message bot';
+      card.innerHTML = `
         <div class="avatar">R</div>
         <div>
           <div class="summary-card">
             <h3>&#9881; Tramada</h3>
-            <div class="summary-row"><span class="label">Status</span><span id="tramStatus">starting…</span></div>
-            <div class="summary-row"><span class="label">Progress</span><span id="tramPct">0%</span></div>
+            <div class="summary-row"><span class="label">Status</span><span class="tram-status">starting…</span></div>
+            <div class="summary-row"><span class="label">Progress</span><span class="tram-pct">0%</span></div>
           </div>
         </div>
       `;
-      chatContainer.appendChild(wrapper);
-      card = wrapper;
+      chatContainer.appendChild(card);
+      tab.progressCard = card;
+      tab.progressRunId = runId || null;
     }
-    const status = card.querySelector('#tramStatus');
-    const pct = card.querySelector('#tramPct');
+
+    const status = card.querySelector('.tram-status');
+    const pct = card.querySelector('.tram-pct');
     if (status) status.textContent = message || '';
     if (pct) pct.textContent = (percent != null ? percent : 0) + '%';
     scrollToBottom();
+  }
+
+  /** Leave the card where it is in the transcript, but stop writing to it. */
+  function freezeProgressCard() {
+    const tab = tabs[renderTab];
+    tab.progressCard = null;
+    tab.progressRunId = null;
   }
 
   function showTramadaAddResult(addResult) {
@@ -1446,11 +1653,50 @@
     scrollToBottom();
   }
 
+  // What the agent read out of Tramada, laid out so the consultant can check the
+  // MAPPING before anything is staged with Mint. Mint's own confirm screen shows
+  // Mint's data and has no idea what Tramada said, so this is the only place the
+  // two systems appear side by side.
+  function addPaymentSummary(p) {
+    const money = (n) => (n == null ? '—' : '$' + Number(n).toFixed(2));
+    const rows = (p.segments || []).map(s => `
+      <tr>
+        <td>${esc(s.reference || '—')}</td>
+        <td style="text-align:right">${esc(s.creditorPayable || '—')}</td>
+      </tr>`).join('');
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message bot';
+    wrapper.innerHTML = `
+      <div class="avatar">R</div>
+      <div>
+        <div class="summary-card">
+          <h3>Booking ${esc(p.bookingNo)} &mdash; creditor payment</h3>
+          <div class="summary-row"><span class="label">Client</span><span>${esc(p.clientName || '—')}</span></div>
+          <div class="summary-row"><span class="label">Supplier</span><span>${esc(p.supplier || '—')}</span></div>
+          <div class="summary-row"><span class="label">Transaction type</span><span>${esc(p.transactionType || '—')}</span></div>
+          <div class="summary-row"><span class="label">Segments</span><span>${(p.segments || []).length}</span></div>
+          <div class="summary-row"><span class="label">Total payable</span><span><b>${money(p.total)}</b></span></div>
+          ${rows ? `<table class="payment-segments"><thead><tr><th>Reference</th><th style="text-align:right">Creditor Payable</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
+        </div>
+      </div>`;
+    chatContainer.appendChild(wrapper);
+    scrollToBottom();
+  }
+
+  function esc(v) {
+    return String(v == null ? '' : v).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  }
+
   function scrollToBottom() {
     chatContainer.scrollTop = chatContainer.scrollHeight;
   }
 
-  connect();
+  // Open all three sockets up front so a background tab still receives its
+  // messages — a payment authorised while the consultant is on another tab must
+  // land in the Payments transcript, not be missed.
+  connectAll();
+  switchTab('flights');
 </script>
 </body>
 </html>
