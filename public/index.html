@@ -161,6 +161,79 @@
     border-bottom: 1px solid var(--raa-warm-grey);
   }
 
+  /* ── Payment cards ──
+     Three cards, one per stage of a payment run: what came out of Tramada
+     (payment_summary), what the consultant is about to key into Westpac
+     (payment_plan), and the field-by-field hand-off (payment_handover). They
+     share the dark summary-card shell so a run reads as one thing, and widen
+     because a field mapping with a business rule on the end does not fit in
+     380px. */
+  /* A fixed width rather than shrink-to-fit, so the three cards of one run
+     line up instead of each sizing to its own longest line. */
+  .summary-card.payment-card { width: 520px; max-width: 100%; }
+
+  .payment-card .summary-row { align-items: baseline; gap: 14px; }
+  /* The label keeps its share: without this a long value squeezes "1. Submit
+     in Westpac" into a two-line column and the mapping stops scanning. */
+  .payment-card .summary-row .label { flex: 0 0 40%; }
+  .payment-card .summary-row span:last-child { flex: 1; text-align: right; }
+
+  /* Sub-fields — the indented steps inside a DVC or IPSI mapping. */
+  .payment-card .summary-row.sub .label { padding-left: 14px; opacity: .55; }
+
+  /* A row that is a heading rather than a value (DVC's numbered steps). */
+  .payment-card .summary-row.step {
+    border-bottom: none;
+    padding-top: 10px;
+    color: var(--raa-yellow);
+    font-weight: 600;
+  }
+
+  .payment-note {
+    font-size: 12px;
+    line-height: 1.5;
+    margin-top: 10px;
+    padding: 8px 10px;
+    border-left: 3px solid rgba(255,255,255,0.25);
+    background: rgba(255,255,255,0.05);
+    border-radius: 0 4px 4px 0;
+  }
+  /* Anything the consultant has to act on before money moves. */
+  .payment-note.warn {
+    border-left-color: var(--raa-yellow);
+    background: rgba(255,230,0,0.10);
+  }
+
+  .payment-stop {
+    font-size: 12.5px;
+    line-height: 1.55;
+    margin-top: 12px;
+    padding: 10px;
+    border-radius: 6px;
+    background: var(--raa-yellow);
+    color: var(--raa-black);
+  }
+  .payment-stop b { font-weight: 700; }
+
+  .payment-where {
+    font-size: 12px;
+    opacity: .75;
+    margin-bottom: 10px;
+    line-height: 1.45;
+  }
+
+  /* DVC step 12's custom data fields. Missing ones are the point of the
+     table, so they are marked rather than left blank. */
+  .payment-fields { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }
+  .payment-fields th {
+    text-align: left; font-weight: 600; padding: 4px 6px;
+    color: var(--raa-yellow); border-bottom: 1px solid rgba(255,255,255,0.2);
+  }
+  .payment-fields td { padding: 4px 6px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+  .payment-fields td.src { opacity: .5; font-size: 11px; }
+  .payment-fields tr.missing td { color: var(--raa-yellow); }
+  .payment-fields tr.missing td.val::after { content: "— not in the booking"; opacity: .8; }
+
   /* ── Tabs ── */
   /* One tab per flow. Each opens its own WebSocket with ?mode=, so the three
      run side by side instead of needing a server restart to switch between
@@ -753,7 +826,7 @@
 <div class="tab-bar" id="tabBar">
   <button class="tab-btn active" data-tab="flights"  onclick="switchTab('flights')"><span class="tab-dot"></span>Flights<span class="tab-hint">Jetstar &rarr; Tramada</span></button>
   <button class="tab-btn"        data-tab="tramada"  onclick="switchTab('tramada')"><span class="tab-dot"></span>Tramada<span class="tab-hint">Bookings, segments, receipts</span></button>
-  <button class="tab-btn"        data-tab="payments" onclick="switchTab('payments')"><span class="tab-dot"></span>Payments<span class="tab-hint">MINT creditor payments</span></button>
+  <button class="tab-btn"        data-tab="payments" onclick="switchTab('payments')"><span class="tab-dot"></span>Payments<span class="tab-hint">Creditor payments</span></button>
 </div>
 
 <div class="main-content">
@@ -780,12 +853,12 @@
     </div>
   </div>
 
-  <!-- Payments: Tramada creditor payment staged with MINT -->
+  <!-- Payments: transaction type, then a Tramada creditor payment staged with it -->
   <div class="chat-panel tab-pane" id="pane-payments">
     <div class="mint-banner" id="mintBanner" style="display:none;"></div>
     <div class="chat-container" id="chatContainer-payments"></div>
     <div class="input-area">
-      <input type="text" id="userInput-payments" placeholder="Booking number (e.g. 13061)&hellip;"
+      <input type="text" id="userInput-payments" placeholder="Transaction type, then a booking number&hellip;"
              onkeydown="if(event.key==='Enter' && !event.shiftKey) sendMessage()">
       <button class="send-btn" id="sendBtn-payments" onclick="sendMessage()">&#10148;</button>
     </div>
@@ -1043,7 +1116,16 @@
         showPdfReceiptPreview(data);
         break;
       case 'payment_summary':
-        addPaymentSummary(data.payment);
+        addPaymentSummary(data.payment, data.view);
+        break;
+      // DVC only — the Westpac request, with the limit and dates worked out.
+      case 'payment_plan':
+        addPaymentPlan(data.plan);
+        break;
+      // The last card of a run: which box each Tramada value goes in, and
+      // where the agent stops.
+      case 'payment_handover':
+        addPaymentHandover(data.handover);
         break;
 
       case 'pipeline_progress':
@@ -1657,31 +1739,111 @@
   // MAPPING before anything is staged with Mint. Mint's own confirm screen shows
   // Mint's data and has no idea what Tramada said, so this is the only place the
   // two systems appear side by side.
-  function addPaymentSummary(p) {
-    const money = (n) => (n == null ? '—' : '$' + Number(n).toFixed(2));
-    const rows = (p.segments || []).map(s => `
-      <tr>
-        <td>${esc(s.reference || '—')}</td>
-        <td style="text-align:right">${esc(s.creditorPayable || '—')}</td>
-      </tr>`).join('');
+  // ── Payment cards ────────────────────────────────────────────────
+  // The server decides what each flow shows — a DVC read has a branch and a
+  // Seg. Type column that a Mint read has neither of, and IPSI has a debtor
+  // where the others have a supplier. So these three renderers draw whatever
+  // `view` describes rather than knowing the four flows themselves; add a
+  // fifth payment system and nothing in here changes.
 
+  function paymentCard(inner) {
     const wrapper = document.createElement('div');
     wrapper.className = 'message bot';
-    wrapper.innerHTML = `
-      <div class="avatar">R</div>
-      <div>
-        <div class="summary-card">
-          <h3>Booking ${esc(p.bookingNo)} &mdash; creditor payment</h3>
-          <div class="summary-row"><span class="label">Client</span><span>${esc(p.clientName || '—')}</span></div>
-          <div class="summary-row"><span class="label">Supplier</span><span>${esc(p.supplier || '—')}</span></div>
-          <div class="summary-row"><span class="label">Transaction type</span><span>${esc(p.transactionType || '—')}</span></div>
-          <div class="summary-row"><span class="label">Segments</span><span>${(p.segments || []).length}</span></div>
-          <div class="summary-row"><span class="label">Total payable</span><span><b>${money(p.total)}</b></span></div>
-          ${rows ? `<table class="payment-segments"><thead><tr><th>Reference</th><th style="text-align:right">Creditor Payable</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
-        </div>
-      </div>`;
+    wrapper.innerHTML = `<div class="avatar">R</div><div><div class="summary-card payment-card">${inner}</div></div>`;
     chatContainer.appendChild(wrapper);
     scrollToBottom();
+  }
+
+  // Values arrive already escaped where the server built them as markup (the
+  // field mappings are unreadable without <b>), so notes and mapped values are
+  // inserted as HTML and everything read raw out of Tramada is escaped here.
+  const noteHtml = (n, cls) => `<div class="payment-note ${cls || ''}">${n}</div>`;
+
+  function summaryRows(rows) {
+    return (rows || []).map(([k, v]) =>
+      `<div class="summary-row"><span class="label">${esc(k)}</span><span>${esc(v)}</span></div>`
+    ).join('');
+  }
+
+  function addPaymentSummary(p, view) {
+    const money = (n) => (n == null ? '\u2014' : '$' + Number(n).toFixed(2));
+
+    // Older servers send no view; keep drawing the Mint card they expect.
+    if (!view) {
+      view = {
+        title: `Booking ${p.bookingNo} \u2014 creditor payment`,
+        rows: [
+          ['Client', p.clientName], ['Supplier', p.supplier],
+          ['Transaction type', p.transactionType],
+          ['Segments', String((p.segments || []).length)],
+          ['Total payable', money(p.total)],
+        ].filter(([, v]) => v != null && v !== ''),
+        segmentColumns: [
+          { key: 'reference', label: 'Reference' },
+          { key: 'creditorPayable', label: 'Creditor Payable', align: 'right' },
+        ],
+        segments: p.segments || [],
+        notes: [],
+      };
+    }
+
+    const cols = view.segmentColumns || [];
+    const head = cols.map(c =>
+      `<th${c.align === 'right' ? ' style="text-align:right"' : ''}>${esc(c.label)}</th>`).join('');
+    const body = (view.segments || []).map(seg => `
+      <tr>${cols.map(c =>
+        `<td${c.align === 'right' ? ' style="text-align:right"' : ''}>${esc(seg[c.key] || '\u2014')}</td>`
+      ).join('')}</tr>`).join('');
+
+    paymentCard(`
+      <h3>${esc(view.title)}</h3>
+      ${summaryRows(view.rows)}
+      ${body ? `<table class="payment-segments"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>` : ''}
+      ${(view.notes || []).map(n => noteHtml(n, 'warn')).join('')}
+    `);
+  }
+
+  // DVC steps 8\u201312 \u2014 the Westpac Create Single Request page. Separate card
+  // from the Tramada read because it is a different screen, and because the
+  // cumulative limit and the validity dates on it are computed rather than
+  // copied: the consultant should see the arithmetic before they key it in.
+  function addPaymentPlan(plan) {
+    const fields = (plan.customFields || []).map(f => `
+      <tr class="${!f.value && !f.optional ? 'missing' : ''}">
+        <td>${esc(f.label)}</td>
+        <td class="val">${f.value ? esc(f.value) : ''}</td>
+        <td class="src">${esc(f.source || '')}</td>
+      </tr>`).join('');
+
+    paymentCard(`
+      <h3>${esc(plan.title)}</h3>
+      ${summaryRows(plan.rows)}
+      ${fields ? `<table class="payment-fields">
+        <thead><tr><th>Custom data field</th><th>Value</th><th>From</th></tr></thead>
+        <tbody>${fields}</tbody></table>` : ''}
+      ${(plan.warnings || []).map(w => noteHtml(w, 'warn')).join('')}
+    `);
+  }
+
+  // The last card of a run. `stop` is what the agent will not do \u2014 every
+  // guide bars it from the button that moves the money \u2014 so it is the loudest
+  // thing on the card rather than a footnote.
+  function addPaymentHandover(h) {
+    const rows = (h.fields || []).map(([k, v]) => {
+      const sub = /^\s/.test(k);
+      if (!v) return `<div class="summary-row step"><span class="label">${esc(k.trim())}</span><span></span></div>`;
+      return `<div class="summary-row${sub ? ' sub' : ''}">` +
+             `<span class="label">${esc(k.trim())}</span><span>${v}</span></div>`;
+    }).join('');
+
+    paymentCard(`
+      <h3>${esc(h.title)}</h3>
+      ${h.where ? `<div class="payment-where">${esc(h.where)}</div>` : ''}
+      ${rows}
+      ${(h.notes || []).map(n => noteHtml(n, 'warn')).join('')}
+      ${h.stop ? `<div class="payment-stop">${h.stop}</div>` : ''}
+      ${h.back ? noteHtml(h.back) : ''}
+    `);
   }
 
   function esc(v) {

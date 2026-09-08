@@ -1,32 +1,41 @@
 /**
- * probe-payment-page.js — map the Tramada Issue Creditor Payment page.
- * ====================================================================
- * Run this ONCE against the sandbox to discover the real field IDs, button
- * labels and table structure of the creditor-payment flow, which nothing in
- * this codebase has ever touched. The MINT payment module is then written
- * against facts instead of against selectors inferred from the receipt page.
+ * probe-payment-page.js — map the Tramada page a payment flow lands on.
+ * =====================================================================
+ * Run this ONCE per flow against the sandbox to discover the real field IDs,
+ * button labels and table structure, so tramada-payment.js is written against
+ * facts instead of against selectors inferred from the receipt page.
  *
- *   node probe-payment-page.js 13061
- *   node probe-payment-page.js 13061 --user me@raa.com.au --pass 'secret'
+ *   node probe-payment-page.js 13061                  # mint (default)
+ *   node probe-payment-page.js 13061 --flow dvc
+ *   node probe-payment-page.js 13061 --flow ipsi
+ *   node probe-payment-page.js 13061 --flow travelpay --user me@raa.com.au --pass 'secret'
+ *
+ * The four flows do not land on the same page. Mint and TravelPay go to
+ * Payments → Issue Creditor Payment; DVC goes to Receipts → Issue Agency
+ * Credit Card Transaction; IPSI goes to Receipts → Issue Debtor Payment
+ * Receipt. Only the first has ever been inspected, so the DVC and IPSI
+ * selectors in tramada-payment.js are educated guesses until this has been run
+ * against them — which is exactly what the errors in that module tell you to do.
  *
  * Credentials are optional: without them it uses whatever session the CDP
  * Chrome already has, and tells you if it needs a manual login first.
  *
  * READ-ONLY BY CONSTRUCTION
  * -------------------------
- * It navigates, it clicks "Add/Issue Payment" to render the form, and it reads.
- * It never fills a field, never ticks an allocation checkbox and never clicks
- * Issue. Every mutating control is listed in the output rather than operated.
- * A probe that can create a creditor payment is not a probe.
+ * It navigates, it clicks the Add/Issue button to render the form, and it
+ * reads. It never fills a field, never ticks an allocation checkbox and never
+ * clicks Issue. Every mutating control is listed in the output rather than
+ * operated. A probe that can create a payment is not a probe.
  *
- * Output: docs/tramada-payment-page-map.json  (machine-readable)
- *         docs/tramada-payment-page-map.md    (readable)
- *         docs/tramada-payment-page.png       (screenshot)
+ * Output (per flow): docs/tramada-<flow>-page-map.json  (machine-readable)
+ *                    docs/tramada-<flow>-page-map.md    (readable)
+ *                    docs/tramada-<flow>-page.png       (screenshot)
  */
 
 const fs = require("fs");
 const path = require("path");
 const { openBrowser, ensureLoggedIn, TRAMADA_BASE_URL } = require("./tramada-receipt");
+const { getFlow, PAYMENT_FLOWS } = require("./tramada-payment");
 
 const args = process.argv.slice(2);
 const bookingNo = args.find((a) => !a.startsWith("--"));
@@ -36,11 +45,17 @@ const flag = (name) => {
 };
 
 if (!bookingNo) {
-  console.error("Usage: node probe-payment-page.js <bookingNo> [--user EMAIL] [--pass PASSWORD]");
+  console.error(
+    "Usage: node probe-payment-page.js <bookingNo> [--flow " +
+      Object.keys(PAYMENT_FLOWS).join("|") +
+      "] [--user EMAIL] [--pass PASSWORD]"
+  );
   process.exit(1);
 }
 
+const flow = getFlow(flag("flow") || "mint");
 const OUT_DIR = path.join(__dirname, "docs");
+const OUT_STEM = `tramada-${flow.id}-page`;
 
 /**
  * Everything interesting about the current page: inputs, selects (with their
@@ -200,42 +215,81 @@ function toMarkdown(snapshots) {
         console.log("[probe] Tramada needs a login — sign in in the CDP Chrome window, then re-run."),
     });
 
-    // Step 2 of the guide: Payments under Booking Transaction. The URL follows
-    // the same shape as every other booking page, but it is a GUESS until this
-    // probe confirms it — which is why navLinks are captured either way.
-    const paymentsUrl = `${TRAMADA_BASE_URL}/booking/booking-payments.htm?mode=edit&id=${encodeURIComponent(bookingNo)}`;
-    console.log("[probe] opening", paymentsUrl);
-    await page.goto(paymentsUrl, { waitUntil: "domcontentloaded" });
-    snapshots.push(await snapshot(page, "Booking Payments (list)"));
+    // Step 2 of the guide: Payments or Receipts under Booking Transaction,
+    // depending on the flow. The URL follows the same shape as every other
+    // booking page, but it is a GUESS until this probe confirms it — which is
+    // why navLinks are captured either way.
+    const listUrl = `${TRAMADA_BASE_URL}/booking/${flow.urlSlug}.htm?mode=edit&id=${encodeURIComponent(bookingNo)}`;
+    console.log(`[probe] flow: ${flow.label} — ${flow.guide}`);
+    console.log("[probe] opening", listUrl);
+    await page.goto(listUrl, { waitUntil: "domcontentloaded" });
+    snapshots.push(await snapshot(page, `Booking ${flow.navText} (list)`));
 
-    // Step 3: the top-right dropdown should read "Creditor Payment", then
-    // "Add/Issue Payment". Follow the button, never a direct form URL — the
-    // receipt module learned the hard way that deep-linking the form breaks
-    // Issue (tramada-receipt.js:372).
-    const addBtn = page
-      .locator('input[value*="Issue Payment" i], input[value*="Add" i][value*="Payment" i], button:has-text("Issue Payment")')
-      .first();
+    // Step 3: set the top-right dropdown to this flow's transaction, then
+    // click its Add/Issue button. Follow the button, never a direct form URL —
+    // the receipt module learned the hard way that deep-linking the form
+    // breaks Issue (tramada-receipt.js:372).
+    //
+    // The dropdown is SET here, not just read: on a page that defaults to a
+    // different transaction the button renders the wrong form, and a map of
+    // the wrong form is worse than no map at all.
+    const chose = await page.evaluate((pattern) => {
+      const re = new RegExp(pattern, "i");
+      for (const sel of document.querySelectorAll("select")) {
+        const opt = Array.from(sel.options).find((o) => re.test(o.text));
+        if (opt) {
+          if (sel.value !== opt.value) {
+            sel.value = opt.value;
+            sel.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+          return opt.text.trim();
+        }
+      }
+      return null;
+    }, flow.listOption);
+    console.log(
+      chose
+        ? `[probe] transaction dropdown set to "${chose}"`
+        : `[probe] no option matching /${flow.listOption}/ — the form below may be the wrong one`
+    );
+    await page.waitForTimeout(800);
+
+    const selector = flow.addButton
+      .split("|")
+      .flatMap((t) => [`input[value*="${t}" i]`, `button:has-text("${t}")`])
+      .join(", ");
+    const addBtn = page.locator(selector).first();
 
     if (await addBtn.count()) {
-      console.log("[probe] clicking Add/Issue Payment");
+      console.log("[probe] clicking", flow.addButton.split("|")[0]);
       await addBtn.click();
       await page.waitForLoadState("domcontentloaded");
       await page.waitForTimeout(2000);
-      snapshots.push(await snapshot(page, "Issue Creditor Payment (form)"));
+      snapshots.push(await snapshot(page, `${flow.label} form`));
     } else {
-      console.log("[probe] no Add/Issue Payment button found — capturing the list page only.");
-      console.log("[probe] check navLinks in the JSON for the real payments URL.");
+      console.log(`[probe] no "${flow.addButton.split("|")[0]}" button found — capturing the list page only.`);
+      console.log("[probe] check navLinks in the JSON for the real URL.");
+    }
+
+    // DVC reads the Booking Profile page too (step 11's Level 1 Branch), so
+    // map it in the same run rather than leaving that lookup unverified.
+    if (flow.needsProfile) {
+      const profileUrl = `${TRAMADA_BASE_URL}/booking/booking-profile.htm?mode=edit&id=${encodeURIComponent(bookingNo)}`;
+      console.log("[probe] opening", profileUrl);
+      await page.goto(profileUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(1000);
+      snapshots.push(await snapshot(page, "Booking Profile (Level 1 Branch)"));
     }
 
     fs.mkdirSync(OUT_DIR, { recursive: true });
-    fs.writeFileSync(path.join(OUT_DIR, "tramada-payment-page-map.json"), JSON.stringify(snapshots, null, 2));
-    fs.writeFileSync(path.join(OUT_DIR, "tramada-payment-page-map.md"), toMarkdown(snapshots));
-    await page.screenshot({ path: path.join(OUT_DIR, "tramada-payment-page.png"), fullPage: true }).catch(() => {});
+    fs.writeFileSync(path.join(OUT_DIR, `${OUT_STEM}-map.json`), JSON.stringify(snapshots, null, 2));
+    fs.writeFileSync(path.join(OUT_DIR, `${OUT_STEM}-map.md`), toMarkdown(snapshots));
+    await page.screenshot({ path: path.join(OUT_DIR, `${OUT_STEM}.png`), fullPage: true }).catch(() => {});
 
     console.log("\n[probe] wrote:");
-    console.log("  docs/tramada-payment-page-map.md   ← read this");
-    console.log("  docs/tramada-payment-page-map.json");
-    console.log("  docs/tramada-payment-page.png");
+    console.log(`  docs/${OUT_STEM}-map.md   ← read this`);
+    console.log(`  docs/${OUT_STEM}-map.json`);
+    console.log(`  docs/${OUT_STEM}.png`);
   } catch (err) {
     console.error("[probe] failed:", err.message);
     process.exitCode = 1;

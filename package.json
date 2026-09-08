@@ -1,7 +1,7 @@
 {
   "name": "jetstar-booking-chatbot",
   "version": "6.0.0",
-  "description": "AI-powered Jetstar flight booking chatbot — Gemini AI agent + Playwright/CDP browser automation",
+  "description": "AI-powered Jetstar flight booking chatbot \u2014 Gemini AI agent + Playwright/CDP browser automation",
   "main": "server.js",
   "scripts": {
     "start": "CDP_MODE=external node server.js",
@@ -15,7 +15,9 @@
     "start:chrome": "./start-chrome.sh",
     "book:cdp": "node booking.js",
     "test:roomres": "node test-roomres.js",
-    "test:bookform": "node test-roomres-bookform.js"
+    "test:bookform": "node test-roomres-bookform.js",
+    "test:payments": "node test-payment-views.js && node test-payment-flows.js",
+    "probe:payment": "node probe-payment-page.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.0",

@@ -30,7 +30,8 @@ const { parseRaaItineraryBuffer } = require("./pdf-itinerary");
 const { runRoomResDraft, runRoomResQuote, closeRoomResPage } = require("./room-res-quote");
 const { runRoomResToTramada, findTramadaClients, lookupBookingClient } = require("./room-res-tramada");
 const roomResChat = require("./roomres-chat");
-const { readCreditorPayment } = require("./tramada-payment");
+const { readPaymentBooking } = require("./tramada-payment");
+const paymentViews = require("./payment-views");
 
 // ─── Config ──────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
@@ -68,6 +69,22 @@ function resolveMode(requested) {
 
 function log(...args) {
   if (DEBUG) console.log("[server]", ...args);
+}
+
+/**
+ * Escape a value being dropped into a bot_message.
+ *
+ * These messages are deliberately HTML — the field mappings are unreadable
+ * without <b> — so the page renders them as markup. That makes every value
+ * read out of Tramada, and everything the consultant types, something that has
+ * to be escaped on the way in: a supplier named "Smith & Sons <AU>" should
+ * appear as itself rather than as a broken tag.
+ */
+function esc(v) {
+  return String(v == null ? "" : v).replace(
+    /[&<>"]/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])
+  );
 }
 
 // Accepts a 3-letter IATA code or a known city name and returns the IATA code.
@@ -128,10 +145,7 @@ wss.on("connection", (ws, req) => {
 
   // Send welcome message
   if (session.mode === "payments") {
-    sendToClient(ws, {
-      type: "bot_message",
-      text: "Creditor payments via MINT. Give me a booking number and I'll read the payment details out of Tramada, then stage the payment for you to authorise in Mint.",
-    });
+    askPaymentType(session);
   } else if (session.pipelineMode) {
     sendToClient(ws, {
       type: "bot_message",
@@ -165,6 +179,8 @@ function createSession(ws, mode = DEFAULT_MODE) {
     roomRes: null,            // Room-Res quote conversation (roomres-chat.js state)
     roomResPending: null,      // that flow paused on a question only the user can answer (creditor / city)
     pendingPayment: null,      // payments tab paused on a supplier choice
+    paymentType: null,         // payments tab: which system the payment goes through
+    pendingBookingNo: null,    // booking number typed before the transaction type
   };
 }
 
@@ -257,16 +273,74 @@ async function handleClientMessage(session, msg) {
   }
 }
 
-// ─── Payments tab (MINT creditor payments) ───────────────────────
-// Steps 1–6 of docs/Payments_Guide_MINT.md. Reads only: it opens the booking,
-// sets EFT, picks the supplier and reads Segments to Allocate, then shows the
-// consultant what it found. Nothing is sent to Mint and nothing is issued in
-// Tramada until they confirm — the confirmation is where the Tramada→Mint
-// MAPPING is visible, which is the one thing Mint's own screen cannot show.
+// ─── Payments tab ────────────────────────────────────────────────
+// Four flows, from docs/: Westpac DVC, Mint, TravelPay and IPSI. The tab asks
+// which one FIRST, because they are not the same job with a different logo on
+// the end — they land on different Tramada pages, read different columns, and
+// three of the four need something from the consultant that Tramada does not
+// hold.
+//
+//   Mint / TravelPay  Payments → Creditor Payment → EFT → Payment To.
+//                     Identical reads; different external forms.
+//   Westpac DVC       Receipts → Agency CC Debtor Receipt → Creditor, then a
+//                     validity period and a cumulative limit the consultant
+//                     has to agree to before a card is requested.
+//   IPSI              Receipts → Debtor Payment Receipt. Money coming IN from
+//                     a customer already charged in IPSI, so the amount and
+//                     reference are transcribed from the IPSI approved page
+//                     and cross-checked against Tramada.
+//
+// Everything here is READ-ONLY in Tramada and read-only in the payment system.
+// Every guide ends the agent's involvement before money moves — Mint BR02,
+// TravelPay BR02, DVC BR07/BR10, IPSI BR07 — so the last thing this code does
+// is show a human exactly what to type, and stop.
 
 function extractBookingNo(text) {
   const m = String(text || "").match(/\b(\d{4,7})\b/);
   return m ? m[1] : null;
+}
+
+// ─── Step 0: which system are we paying through? ──────────────────
+// Asked FIRST so the answer is on the record before any booking is touched:
+// the flow decides which Tramada page is even opened, so it cannot be inferred
+// later from a form that is already half filled in.
+const PAYMENT_TYPES = [
+  { id: "dvc",       label: "Westpac DVC", match: /^(1|w|westpac|dvc|westpac ?dvc)$/ },
+  { id: "mint",      label: "Mint",        match: /^(2|m|mint|mint ?eft)$/ },
+  { id: "travelpay", label: "TravelPay",   match: /^(3|t|travel ?pay)$/ },
+  { id: "ipsi",      label: "IPSI",        match: /^(4|i|ipsi)$/ },
+];
+
+const PAYMENT_TYPE_LABELS = PAYMENT_TYPES.map((t) => t.label);
+
+/**
+ * The chosen transaction type, or `null` for anything unrecognised.
+ *
+ * Deliberately strict — the four systems are the whole list, and a near-miss
+ * re-asks rather than picking the closest one. Sending a payment through the
+ * wrong system is not something the consultant can undo from this screen.
+ */
+function readPaymentType(text) {
+  const t = String(text || "").trim().toLowerCase().replace(/[.!?]+$/, "");
+  if (!t) return null;
+  return PAYMENT_TYPES.find((type) => type.match.test(t)) || null;
+}
+
+function askPaymentType(session, prefix) {
+  sendToClient(session.ws, {
+    type: "bot_message",
+    text:
+      (prefix ? prefix + "<br><br>" : "") +
+      "What kind of transaction do you want me to pay?",
+    quickReplies: PAYMENT_TYPE_LABELS,
+  });
+}
+
+/** What to ask for after the type is settled. IPSI takes money from a customer. */
+function bookingPrompt(type) {
+  return type.id === "ipsi"
+    ? `<b>IPSI</b> it is — a customer receipt. What's the booking number from the IPSI approved page?`
+    : `<b>${type.label}</b> it is. What's the booking number?`;
 }
 
 /**
@@ -274,8 +348,8 @@ function extractBookingNo(text) {
  *
  * Returns `null` for anything it does not recognise, and the caller re-asks.
  * Unclear must never fall through to yes: this is the last gate before a
- * consultant is sent to MintEFT to move real money, and a loose /yes|y/ test
- * matches the "y" in "why?" and the "no" branch never runs at all.
+ * consultant is sent off to move real money, and a loose /yes|y/ test matches
+ * the "y" in "why?" and the "no" branch never runs at all.
  */
 function readYesNo(text) {
   const t = String(text || "").trim().toLowerCase().replace(/[.!]+$/, "");
@@ -285,39 +359,114 @@ function readYesNo(text) {
 }
 
 /**
- * Step 9's field mapping, and the full stop at step 10.
+ * The last screen: the field-by-field mapping, and the full stop.
  *
- * BR02 — the agent never makes the payment on Mint; a human does. What it can
- * do is name which MintEFT box each Tramada value goes in, which is the one
- * thing Mint's own screen cannot show: over there the consultant is looking at
- * empty fields with nothing to say what Tramada called any of them.
+ * The mapping is the one thing the payment system's own screen cannot show —
+ * over there the consultant is looking at empty fields with nothing to say
+ * what Tramada called any of them. Sent as a card rather than a paragraph so
+ * the values can be read off one at a time while typing.
  */
-function sendMintHandover(session, p) {
-  const { ws } = session;
-  const money = (n) => (n == null ? "&mdash;" : "$" + Number(n).toFixed(2));
+function sendPaymentHandover(session, result, extra) {
+  sendToClient(session.ws, {
+    type: "payment_handover",
+    handover: paymentViews.handoverView(result, extra || {}),
+  });
+}
 
-  // BR01 — no reference number is a hand-off to a human, not a stop. The rest
-  // of the mapping is still worth showing; the missing field is called out.
-  const reference = (p.segments || []).map((s) => s.reference).filter(Boolean)[0] || null;
-  const lastName = String(p.clientName || "").trim().split(/\s+/).pop() || "&mdash;";
+/* ── IPSI: the four values off the approved page ─────────────────── */
+// Step 1 of the IPSI guide happens before the agent is involved at all: a human
+// takes the card over the phone and IPSI shows an Approved page. These are the
+// four things on it that Tramada needs, asked one at a time because they are
+// being transcribed off another screen.
+const IPSI_QUESTIONS = [
+  {
+    key: "transactionRef",
+    ask: "What's the <b>IPSI transaction reference number</b> from the approved page?",
+    parse: (t) => (t.trim() ? t.trim() : null),
+    retry: "I need the transaction reference from the IPSI approved page — it goes into Tramada's Reference field.",
+  },
+  {
+    key: "cardholderName",
+    // BR01/BR05 — the person who actually paid, which is not always the client.
+    ask:
+      "What's the <b>cardholder name</b> from the approved page?<br><br>" +
+      "If the person paying isn't the customer on the booking, give me their first and last name (BR01).",
+    parse: (t) => (t.trim().length >= 2 ? t.trim() : null),
+    retry: "I need the cardholder's name as it appears on the IPSI approved page.",
+  },
+  {
+    key: "amount",
+    ask: "What <b>amount</b> did IPSI approve?",
+    parse: (t) => {
+      const n = Number(String(t).replace(/[^0-9.]/g, ""));
+      return Number.isFinite(n) && n > 0 ? n : null;
+    },
+    retry: "Give me the approved amount as a number, e.g. <b>374.29</b>.",
+  },
+  {
+    key: "cardType",
+    // BR02 — confirmed with the customer, because it picks which dummy card is
+    // used in Tramada. BR04 means the real number is never entered anywhere.
+    ask: "What <b>card type</b> did the customer use? I'll match the RAA dummy card to it (BR02/BR04).",
+    parse: (t) => {
+      const s = String(t).trim().toLowerCase();
+      const known = [
+        ["visa", "Visa"],
+        ["master", "Mastercard"],
+        ["mc", "Mastercard"],
+        ["amex", "Amex"],
+        ["american express", "Amex"],
+        ["diners", "Diners"],
+      ].find(([k]) => s.includes(k));
+      return known ? known[1] : null;
+    },
+    retry: "Which card type — <b>Visa</b>, <b>Mastercard</b>, <b>Amex</b> or <b>Diners</b>?",
+    quickReplies: ["Visa", "Mastercard", "Amex", "Diners"],
+  },
+];
 
-  const rows = [
-    ["Recipient Reference", reference || "<i>no reference on the segment &mdash; BR01, raise it with a human</i>"],
-    ["Sender Reference", p.bookingNo],
-    ["Passenger Name", lastName],
-    ["Total Amount", money(p.total)],
-    ["Payment Date", "today"],
-    ["Payee Name or Number", p.supplier || "&mdash;"],
-  ]
-    .map(([k, v]) => `<b>${k}</b> &rarr; ${v}`)
-    .join("<br>");
+function askIpsiQuestion(session, index, prefix) {
+  const q = IPSI_QUESTIONS[index];
+  sendToClient(session.ws, {
+    type: "bot_message",
+    text: (prefix ? prefix + "<br><br>" : "") + q.ask,
+    quickReplies: q.quickReplies,
+  });
+}
 
-  sendToClient(ws, {
+/* ── DVC: the validity period (BR03) ─────────────────────────────── */
+
+function askDvcValidity(session, prefix) {
+  sendToClient(session.ws, {
     type: "bot_message",
     text:
-      `Here is booking <b>${p.bookingNo}</b> mapped onto MintEFT's New Payment form:<br><br>${rows}<br><br>` +
-      `<b>The payment is yours to make</b> — I don't touch Mint. Create it there and press Confirm; ` +
-      `the <b>M00\u2026</b> transaction id it gives back is what goes into Tramada's Reference field (step 12).`,
+      (prefix ? prefix + "<br><br>" : "") +
+      "How long should the card be valid for?<br><br>" +
+      "<b>Standard</b> is 7 days from today. Use <b>custom</b> for an overseas hotel where " +
+      "check-in is further out than that, and I'll run the card to the check-in date (BR03).",
+    quickReplies: ["Standard (7 days)", "Custom check-in date"],
+  });
+}
+
+/**
+ * DVC steps 8–12 — the Westpac request, with the arithmetic done.
+ *
+ * Sent as its own card because it is a different screen from the Tramada read:
+ * this is what the consultant is about to key into Create Single Request, and
+ * the cumulative limit and validity dates on it are computed, not copied.
+ */
+function sendDvcPlan(session, pending) {
+  const plan = paymentViews.dvcPlanView(pending.payment, pending.answers, new Date());
+  pending.plan = plan;
+
+  sendToClient(session.ws, { type: "payment_plan", plan });
+
+  sendToClient(session.ws, {
+    type: "bot_message",
+    text:
+      `That's the Westpac request for booking <b>${pending.payment.bookingNo}</b>. ` +
+      `Shall I show you the rest — Submit, the card into the booking notes, and the receipt back in Tramada?`,
+    quickReplies: ["Yes", "No"],
   });
 }
 
@@ -327,15 +476,157 @@ async function handlePaymentsMessage(session, userText) {
 
   if (/^(cancel|stop|reset|start over)$/i.test(text)) {
     session.pendingPayment = null;
-    sendToClient(ws, { type: "bot_message", text: "Cleared. Give me a booking number when you're ready." });
+    session.pendingBookingNo = null;
+    // Back to the top, not back to the booking prompt: "start over" on a
+    // payment run means the transaction type is up for grabs again too.
+    session.paymentType = null;
+    askPaymentType(session, "Cleared.");
+    return;
+  }
+
+  // ── Step 0 — the transaction type, before anything else ──────────
+  // Nothing below this point runs until it is answered, so a booking number
+  // sent first is held rather than dropped, and the consultant does not have
+  // to type it a second time.
+  if (!session.paymentType) {
+    const chosen = readPaymentType(text);
+    if (!chosen) {
+      const early = extractBookingNo(text);
+      if (early) session.pendingBookingNo = early;
+      askPaymentType(
+        session,
+        early
+          ? `Got booking <b>${early}</b> — I'll come back to it.`
+          : `I need one of the four: ${PAYMENT_TYPE_LABELS.join(", ")}.`
+      );
+      return;
+    }
+
+    session.paymentType = chosen;
+
+    // A booking number sent ahead of the type answers the next question too,
+    // so ask it only when it is genuinely still open.
+    const held = session.pendingBookingNo;
+    session.pendingBookingNo = null;
+    if (held) {
+      sendToClient(ws, {
+        type: "bot_message",
+        text: `<b>${chosen.label}</b> it is — picking up booking <b>${held}</b>.`,
+      });
+      await runPaymentRead(session, held, null);
+      return;
+    }
+
+    sendToClient(ws, { type: "bot_message", text: bookingPrompt(chosen) });
+    return;
+  }
+
+  // The type is settled, but naming another one is a change of mind rather
+  // than a booking number that failed to parse — take it and re-ask.
+  if (!session.pendingPayment) {
+    const switched = readPaymentType(text);
+    if (switched && switched.id !== session.paymentType.id) {
+      session.paymentType = switched;
+      sendToClient(ws, { type: "bot_message", text: `Switched to ${bookingPrompt(switched)}` });
+      return;
+    }
+  }
+
+  const pending = session.pendingPayment;
+
+  // ── IPSI — transcribing the approved page, one field at a time ───
+  if (pending && pending.awaitingIpsi != null) {
+    const index = pending.awaitingIpsi;
+    const q = IPSI_QUESTIONS[index];
+    const value = q.parse(text);
+    if (value == null) {
+      sendToClient(ws, { type: "bot_message", text: q.retry, quickReplies: q.quickReplies });
+      return;
+    }
+    pending.ipsi[q.key] = value;
+
+    if (index + 1 < IPSI_QUESTIONS.length) {
+      pending.awaitingIpsi = index + 1;
+      askIpsiQuestion(session, index + 1);
+      return;
+    }
+
+    // All four in hand. The cross-check against Tramada is the whole reason
+    // for reading the booking before asking: BR06 says the allocation must
+    // match, and a mismatch is worth surfacing before the receipt is drafted
+    // rather than after it is issued.
+    pending.awaitingIpsi = null;
+    pending.awaitingConfirm = true;
+    const diff =
+      Math.abs(Number(pending.ipsi.amount) - Number(pending.payment.total || 0)) > 0.005;
+    sendToClient(ws, {
+      type: "bot_message",
+      text:
+        `Got it — <b>$${Number(pending.ipsi.amount).toFixed(2)}</b> from ` +
+        `<b>${esc(pending.ipsi.cardholderName)}</b> on a ${pending.ipsi.cardType} card, ` +
+        `reference <b>${esc(pending.ipsi.transactionRef)}</b>.` +
+        (diff
+          ? `<br><br><b>That doesn't match Tramada</b>, which has ` +
+            `$${Number(pending.payment.total || 0).toFixed(2)} to allocate. BR06 says these must ` +
+            `agree before you tick the A column.`
+          : "") +
+        `<br><br>Shall I map it onto the Tramada receipt?`,
+      quickReplies: ["Yes", "No"],
+    });
+    return;
+  }
+
+  // ── DVC — the validity period, then a date if they chose custom ──
+  if (pending && pending.awaitingValidity) {
+    if (/^(1|standard|standard \(7 days\)|7|7 days)$/i.test(text)) {
+      pending.awaitingValidity = false;
+      pending.answers = { validity: "standard" };
+      sendDvcPlan(session, pending);
+      pending.awaitingConfirm = true;
+      return;
+    }
+    if (/^(2|custom|custom check-?in date|check-?in)$/i.test(text)) {
+      pending.awaitingValidity = false;
+      pending.awaitingCheckIn = true;
+      sendToClient(ws, {
+        type: "bot_message",
+        text: "What's the <b>check-in date</b>? (DD/MM/YYYY)",
+      });
+      return;
+    }
+    // A date typed straight at the question is a custom period — take it.
+    const asDate = paymentViews.parseDate(text);
+    if (asDate) {
+      pending.awaitingValidity = false;
+      pending.answers = { validity: "custom", checkInDate: asDate };
+      sendDvcPlan(session, pending);
+      pending.awaitingConfirm = true;
+      return;
+    }
+    askDvcValidity(session, "I need one or the other.");
+    return;
+  }
+
+  if (pending && pending.awaitingCheckIn) {
+    const date = paymentViews.parseDate(text);
+    if (!date) {
+      sendToClient(ws, {
+        type: "bot_message",
+        text: "I couldn't read that as a date. Give it to me as <b>DD/MM/YYYY</b> — e.g. 25/12/2026.",
+      });
+      return;
+    }
+    pending.awaitingCheckIn = false;
+    pending.answers = { validity: "custom", checkInDate: date };
+    sendDvcPlan(session, pending);
+    pending.awaitingConfirm = true;
     return;
   }
 
   // Awaiting the Yes/No in front of the payment. Handled before anything else
   // reads this message, so a bare "no" here is a no to THIS question and not a
   // booking number that failed to parse.
-  if (session.pendingPayment && session.pendingPayment.awaitingConfirm) {
-    const pending = session.pendingPayment;
+  if (pending && pending.awaitingConfirm) {
     const answer = readYesNo(text);
 
     // A booking number typed at the prompt means "a different booking" — take
@@ -352,8 +643,8 @@ async function handlePaymentsMessage(session, userText) {
       sendToClient(ws, {
         type: "bot_message",
         text:
-          `Stopped there — nothing went to Mint and nothing was issued in Tramada for booking ` +
-          `<b>${pending.bookingNo}</b>. Send me another booking number when you're ready.`,
+          `Stopped there — nothing went to ${session.paymentType.label} and nothing was issued in ` +
+          `Tramada for booking <b>${pending.bookingNo}</b>. Send me another booking number when you're ready.`,
       });
       return;
     }
@@ -368,13 +659,13 @@ async function handlePaymentsMessage(session, userText) {
     }
 
     session.pendingPayment = null;
-    sendMintHandover(session, pending.payment);
+    sendPaymentHandover(session, pending.payment, { plan: pending.plan, ipsi: pending.ipsi });
     return;
   }
 
   // Awaiting a supplier choice from a multi-creditor booking.
-  if (session.pendingPayment && session.pendingPayment.awaitingSupplier) {
-    const { bookingNo, suppliers } = session.pendingPayment;
+  if (pending && pending.awaitingSupplier) {
+    const { bookingNo, suppliers } = pending;
     const byIndex = /^\d+$/.test(text) ? suppliers[Number(text) - 1] : null;
     const chosen =
       byIndex ||
@@ -384,7 +675,7 @@ async function handlePaymentsMessage(session, userText) {
     if (!chosen) {
       sendToClient(ws, {
         type: "bot_message",
-        text: `I couldn't match "${text}" to a supplier on booking ${bookingNo}. Reply with the number from the list, or the supplier name.`,
+        text: `I couldn't match "${esc(text)}" to a supplier on booking ${bookingNo}. Reply with the number from the list, or the supplier name.`,
       });
       return;
     }
@@ -397,7 +688,11 @@ async function handlePaymentsMessage(session, userText) {
   if (!bookingNo) {
     sendToClient(ws, {
       type: "bot_message",
-      text: "Give me a booking number (e.g. <b>13061</b>) and I'll read the creditor payment out of Tramada.",
+      text:
+        `Give me a booking number (e.g. <b>13061</b>) and I'll read the ` +
+        `<b>${session.paymentType.label}</b> ${
+          session.paymentType.id === "ipsi" ? "receipt" : "creditor payment"
+        } out of Tramada.`,
     });
     return;
   }
@@ -409,6 +704,7 @@ let paymentReadSeq = 0;
 
 async function runPaymentRead(session, bookingNo, supplier) {
   const { ws } = session;
+  const type = session.paymentType;
 
   if (session.automationRunning) {
     sendToClient(ws, { type: "bot_message", text: "Already reading a booking — give that one a moment." });
@@ -424,11 +720,12 @@ async function runPaymentRead(session, bookingNo, supplier) {
 
   sendToClient(ws, {
     type: "bot_message",
-    text: `Reading booking <b>${bookingNo}</b> in Tramada${supplier ? ` for <b>${supplier}</b>` : ""}…`,
+    text: `Reading booking <b>${bookingNo}</b> in Tramada for <b>${type.label}</b>${supplier ? ` — <b>${esc(supplier)}</b>` : ""}…`,
   });
 
   try {
-    const result = await readCreditorPayment({
+    const result = await readPaymentBooking({
+      flow: type.id,
       bookingNo,
       supplier,
       callbacks: {
@@ -442,22 +739,25 @@ async function runPaymentRead(session, bookingNo, supplier) {
       },
     });
 
-    // More than one creditor means more than one payment: one Mint transaction
-    // and one human authorisation each. Ask rather than guess — paying the right
-    // amount to the wrong supplier has no automated recovery.
+    // More than one creditor means more than one payment: one external
+    // transaction and one human authorisation each. DVC BR08 spells it out —
+    // one card per supplier, per booking. Ask rather than guess: paying the
+    // right amount to the wrong supplier has no automated recovery.
     if (result.needsSupplierChoice) {
       session.pendingPayment = { bookingNo, awaitingSupplier: true, suppliers: result.suppliers };
-      const list = result.suppliers.map((o, i) => `${i + 1}. ${o.text}`).join("<br>");
+      const list = result.suppliers.map((o, i) => `${i + 1}. ${esc(o.text)}`).join("<br>");
       sendToClient(ws, {
         type: "bot_message",
         text:
-          `Booking <b>${bookingNo}</b> (${result.clientName || "client unknown"}) has ${result.suppliers.length} creditors. ` +
-          `Each is its own payment. Which one are we paying?<br><br>${list}`,
+          `Booking <b>${bookingNo}</b> (${esc(result.clientName || "client unknown")}) has ` +
+          `${result.suppliers.length} creditors. Each is its own payment` +
+          (type.id === "dvc" ? " and its own card (BR08)" : "") +
+          `. Which one are we paying?<br><br>${list}`,
       });
       return;
     }
 
-    sendToClient(ws, { type: "payment_summary", payment: result });
+    sendToClient(ws, { type: "payment_summary", payment: result, view: paymentViews.summaryView(result) });
 
     if (!result.segmentsFound || result.segments.length === 0) {
       session.pendingPayment = null;
@@ -465,22 +765,50 @@ async function runPaymentRead(session, bookingNo, supplier) {
         type: "bot_message",
         text:
           `Nothing to allocate on booking <b>${bookingNo}</b> — the Segments to Allocate table is empty, ` +
-          `so there's no creditor payable here. Send me another booking number.`,
+          `so there's no ${type.id === "ipsi" ? "outstanding amount" : "creditor payable"} here. ` +
+          `Send me another booking number.`,
       });
       return;
     }
 
-    // Found, and there is something to pay. The only question left is whether
-    // to carry on, and it is asked with buttons rather than taken off free
-    // text: this is the last gate before a consultant is sent to MintEFT, and
-    // a typed answer is where "no, don't" gets read as a yes.
-    session.pendingPayment = { bookingNo, awaitingConfirm: true, payment: result };
+    const pending = { bookingNo, payment: result, ipsi: {}, answers: null, plan: null };
+    session.pendingPayment = pending;
+
+    // Each flow asks for whatever Tramada could not tell it, then confirms.
+    // The confirm is always last and always buttons rather than free text:
+    // it is the gate in front of a human being sent to move money, and a typed
+    // answer is where "no, don't" gets read as a yes.
+    if (type.id === "ipsi") {
+      pending.awaitingIpsi = 0;
+      askIpsiQuestion(
+        session,
+        0,
+        `Booking <b>${bookingNo}</b> found — <b>$${Number(result.total || 0).toFixed(2)}</b> to allocate ` +
+          `across ${result.segments.length} segment${result.segments.length === 1 ? "" : "s"}.<br><br>` +
+          `Now the four values off the IPSI approved page.`
+      );
+      return;
+    }
+
+    if (type.id === "dvc") {
+      pending.awaitingValidity = true;
+      askDvcValidity(
+        session,
+        `Booking <b>${bookingNo}</b> found — ${result.supplier ? `<b>${esc(result.supplier)}</b>, ` : ""}` +
+          `<b>$${Number(result.total || 0).toFixed(2)}</b> across ${result.segments.length} ` +
+          `segment${result.segments.length === 1 ? "" : "s"}.`
+      );
+      return;
+    }
+
+    pending.awaitingConfirm = true;
     sendToClient(ws, {
       type: "bot_message",
       text:
-        `Booking <b>${bookingNo}</b> found — ${result.supplier ? `<b>${result.supplier}</b>, ` : ""}` +
+        `Booking <b>${bookingNo}</b> found — ${result.supplier ? `<b>${esc(result.supplier)}</b>, ` : ""}` +
         `<b>$${Number(result.total || 0).toFixed(2)}</b> across ${result.segments.length} ` +
-        `segment${result.segments.length === 1 ? "" : "s"}.<br><br>Continue with making the payment?`,
+        `segment${result.segments.length === 1 ? "" : "s"}.<br><br>` +
+        `Continue with making the payment via <b>${type.label}</b>?`,
       quickReplies: ["Yes", "No"],
     });
   } catch (err) {
