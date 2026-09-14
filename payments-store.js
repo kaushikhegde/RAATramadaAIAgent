@@ -86,6 +86,9 @@ function create(fields) {
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     status: fields.invoiceReference ? "pending" : "draft",
+    // Which external system this record belongs to. Defaults to "mint" for
+    // back-compat with records created before the DVC/ICCP path existed.
+    provider: fields.provider || "mint",
     // Tramada side
     bookingNo: fields.bookingNo || null,
     invoiceReference: fields.invoiceReference || null,
@@ -98,6 +101,15 @@ function create(fields) {
     mintTransactionId: null,
     mintStatus: null,
     payeeCompanyNumber: fields.payeeCompanyNumber || null,
+    // ICCP/DVC side — deliberately NEVER the full card number or CVV. See
+    // dvc-card-issuer.js: those are shown to the consultant once and never
+    // passed to this store.
+    purchaseRequestId: null,
+    vcnLast4: null,
+    vcnExpiry: null,
+    cumulativeLimit: fields.cumulativeLimit ?? null,
+    validFrom: fields.validFrom || null,
+    validTo: fields.validTo || null,
     // Who
     consultantEmail: fields.consultantEmail || null,
     history: [],

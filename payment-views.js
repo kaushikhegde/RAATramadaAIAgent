@@ -405,21 +405,37 @@ function travelpayHandover(result) {
 /**
  * DVC steps 13–18 — what happens after Westpac hands over a card.
  *
- * Three separate human actions, in order, and the agent is barred from all
- * three: Submit in Westpac (BR07), paying the supplier (BR10), and the card
- * details never passing through the agent at all (BR09 / the LastPass note).
+ * Three separate human actions, in order, and the agent is barred from two of
+ * them regardless of path: paying the supplier (BR10), and the card details
+ * never being handled by the agent beyond a one-time display (BR09 / the
+ * LastPass note). The first — Submit in Westpac (BR07) — has two shapes:
+ * manual (default: the consultant clicks Submit in the Westpac portal, exactly
+ * as the guide describes) or, when `issuedCard` is supplied, via the ICCP API
+ * after the consultant typed the explicit "CREATE CARD" confirmation
+ * (dvc-card-issuer.js) — see that module's header for why the human gate had
+ * to move to sit in front of the API call instead.
  */
-function dvcHandover(result, plan) {
+function dvcHandover(result, plan, issuedCard) {
   const ref = firstReference(result);
   const token = ref ? referenceToken(ref) : null;
+
+  const step1 = issuedCard
+    ? [
+        "1. Card generated via Mastercard ICCP",
+        `done — purchase request <b>${h(issuedCard.purchaseRequestId)}</b>` +
+          (issuedCard.environment !== "production" ? ` (${h(issuedCard.environment)} environment)` : ""),
+      ]
+    : ["1. Submit in Westpac", "<b>you click Submit</b>, not me (BR07) — the card, expiry and CVV show once"];
+
   return {
-    system: "Westpac Commercial Cards",
+    system: issuedCard ? "Mastercard ICCP / Westpac DVC" : "Westpac Commercial Cards",
     title: `Booking ${result.bookingNo} → Westpac DVC, then back into Tramada`,
-    where:
-      "In the Westpac portal: Payment Control → Purchase Requests → Create Single Request, " +
-      "filled in as above.",
+    where: issuedCard
+      ? "The card above was generated via the Mastercard ICCP API — nothing further needed in the Westpac portal for this card."
+      : "In the Westpac portal: Payment Control → Purchase Requests → Create Single Request, " +
+        "filled in as above.",
     fields: [
-      ["1. Submit in Westpac", "<b>you click Submit</b>, not me (BR07) — the card, expiry and CVV show once"],
+      step1,
       ["2. Copy the card into Tramada", "booking Summary → Booking notes: card number, expiry, CVC (BR09)"],
       ["3. Pay the supplier", "on their own portal with the DVC, and keep the payment reference (BR10)"],
       ["4. Back on Issue Agency Credit Card Transaction", ""],
@@ -432,8 +448,9 @@ function dvcHandover(result, plan) {
       ["5. Segments to Allocate", "tick the A column, then Issue"],
     ],
     stop:
-      `<b>Submit is yours</b> (BR07), and so is the payment on the supplier's portal (BR10). ` +
-      `One card per supplier per booking — paying a second supplier means running this again (BR08).`,
+      (issuedCard ? "" : `<b>Submit is yours</b> (BR07), and so is `) +
+      (issuedCard ? `<b>Paying the supplier is yours</b> (BR10).` : `the payment on the supplier's portal (BR10).`) +
+      ` One card per supplier per booking — paying a second supplier means running this again (BR08).`,
     back:
       `The reference from the supplier's portal goes into Tramada's <b>Reference</b> field with the ` +
       `<b>RRC - </b> prefix (BR11) — e.g. <b>RRC - MG752045</b>.`,
@@ -505,7 +522,7 @@ function handoverView(result, extra = {}) {
     case "travelpay":
       return travelpayHandover(result);
     case "dvc":
-      return dvcHandover(result, extra.plan);
+      return dvcHandover(result, extra.plan, extra.issuedCard);
     case "ipsi":
       return ipsiHandover(result, extra.ipsi || {});
     default:

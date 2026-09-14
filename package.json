@@ -1,7 +1,7 @@
 {
   "name": "jetstar-booking-chatbot",
   "version": "6.0.0",
-  "description": "AI-powered Jetstar flight booking chatbot \u2014 Gemini AI agent + Playwright/CDP browser automation",
+  "description": "AI-powered Jetstar flight booking chatbot — Gemini AI agent + Playwright/CDP browser automation",
   "main": "server.js",
   "scripts": {
     "start": "CDP_MODE=external node server.js",
@@ -23,11 +23,15 @@
     "@google/generative-ai": "^0.24.0",
     "dotenv": "^16.4.0",
     "express": "^4.21.0",
+    "fast-xml-parser": "^5.11.1",
+    "mastercard-oauth1-signer": "^1.2.0",
+    "node-forge": "^1.4.0",
     "pdf-parse": "^1.1.1",
     "playwright": "^1.58.2",
     "puppeteer-core": "npm:rebrowser-puppeteer-core@^24.0.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "xmlbuilder2": "^4.0.3"
   }
 }

@@ -32,6 +32,8 @@ const { runRoomResToTramada, findTramadaClients, lookupBookingClient } = require
 const roomResChat = require("./roomres-chat");
 const { readPaymentBooking } = require("./tramada-payment");
 const paymentViews = require("./payment-views");
+const dvcCardIssuer = require("./dvc-card-issuer");
+const iccpClient = require("./iccp-client");
 
 // ─── Config ──────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
@@ -461,12 +463,19 @@ function sendDvcPlan(session, pending) {
 
   sendToClient(session.ws, { type: "payment_plan", plan });
 
+  const missingRequired = plan.warnings.some((w) => /missing from the tramada booking/i.test(w));
+  const canOfferApi = iccpClient.isConfigured() && !missingRequired;
+
   sendToClient(session.ws, {
     type: "bot_message",
     text:
       `That's the Westpac request for booking <b>${pending.payment.bookingNo}</b>. ` +
-      `Shall I show you the rest — Submit, the card into the booking notes, and the receipt back in Tramada?`,
-    quickReplies: ["Yes", "No"],
+      (canOfferApi
+        ? `I can generate this DVC right now via the Mastercard ICCP API ` +
+          `(${iccpClient.environment() === "mock" ? "local mock — no real card is created" : iccpClient.environment()} environment). ` +
+          `Reply <b>CREATE CARD</b> to do that, or <b>Yes</b> to see the manual Westpac-portal steps instead.`
+        : `Shall I show you the rest — Submit, the card into the booking notes, and the receipt back in Tramada?`),
+    quickReplies: canOfferApi ? ["CREATE CARD", "Yes", "No"] : ["Yes", "No"],
   });
 }
 
@@ -627,6 +636,54 @@ async function handlePaymentsMessage(session, userText) {
   // reads this message, so a bare "no" here is a no to THIS question and not a
   // booking number that failed to parse.
   if (pending && pending.awaitingConfirm) {
+    // DVC only, and only this exact literal — see dvc-card-issuer.js's
+    // header for why "CREATE CARD" has to be its own confirmation rather than
+    // a generic yes: this one actually calls Mastercard and creates a live
+    // card, where "yes" everywhere else in this flow only ever displays text.
+    if (session.paymentType.id === "dvc" && /^create\s*card$/i.test(text.trim())) {
+      session.pendingPayment = null;
+      sendToClient(ws, {
+        type: "bot_message",
+        text: `Requesting the card from Mastercard ICCP for booking <b>${pending.bookingNo}</b>…`,
+      });
+      try {
+        const issued = await dvcCardIssuer.issueCard({
+          result: pending.payment,
+          plan: pending.plan,
+          confirm: "CREATE CARD",
+          consultantEmail: pending.payment.consultant || null,
+          // dvc-card-issuer.js supports an onRequestBuilt(xml) callback that
+          // surfaces the raw outgoing SOAP request — useful for a proof/debug
+          // session, too technical for day-to-day use, so left disconnected
+          // here rather than removed. Wire it back in if that's needed again.
+        });
+        sendToClient(ws, {
+          type: "dvc_card_issued",
+          card: {
+            purchaseRequestId: issued.purchaseRequestId,
+            cardNumber: issued.cardNumber,
+            expiry: issued.expiry,
+            cvv: issued.cvv,
+            environment: issued.environment,
+          },
+        });
+        sendToClient(ws, {
+          type: "bot_message",
+          text:
+            `<b>Card created</b> (${issued.environment} environment) — purchase request ` +
+            `<b>${issued.purchaseRequestId}</b>. Copy the number, expiry and CVV above into the booking's ` +
+            `Tramada notes and your password manager now — I don't store them and won't show them again.`,
+        });
+        sendPaymentHandover(session, pending.payment, { plan: pending.plan, issuedCard: issued });
+      } catch (err) {
+        sendToClient(ws, {
+          type: "error",
+          text: `Card creation failed: ${err.message}. Nothing was charged or created — you can try again or use the manual Westpac-portal steps.`,
+        });
+      }
+      return;
+    }
+
     const answer = readYesNo(text);
 
     // A booking number typed at the prompt means "a different booking" — take

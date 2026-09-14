@@ -232,6 +232,30 @@
   .payment-fields td { padding: 4px 6px; border-bottom: 1px solid rgba(255,255,255,0.08); }
   .payment-fields td.src { opacity: .5; font-size: 11px; }
   .payment-fields tr.missing td { color: var(--raa-yellow); }
+
+  /* The raw SOAP request sent to Mastercard ICCP — a scrollable, monospace
+     block rather than reflowed text, since line breaks in XML are meaningful
+     here and the whole point is showing exactly what was sent. */
+  .iccp-request-xml {
+    max-height: 320px;
+    overflow: auto;
+    margin: 0;
+    padding: 10px;
+    font-family: 'SF Mono', Consolas, 'Courier New', monospace;
+    font-size: 11px;
+    line-height: 1.5;
+    white-space: pre;
+    background: rgba(0,0,0,0.35);
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+  /* Card number / expiry / CVV — set apart from ordinary text values so they
+     read unambiguously as the thing to copy, not prose. */
+  .payment-card .summary-row span.mono {
+    font-family: 'SF Mono', Consolas, 'Courier New', monospace;
+    font-size: 13px;
+    letter-spacing: 0.5px;
+  }
   .payment-fields tr.missing td.val::after { content: "— not in the booking"; opacity: .8; }
 
   /* ── Tabs ── */
@@ -1127,6 +1151,16 @@
       case 'payment_handover':
         addPaymentHandover(data.handover);
         break;
+      // DVC-via-API only — the exact SOAP request sent to Mastercard ICCP,
+      // shown at the moment it's built (before the response comes back).
+      case 'iccp_request':
+        addIccpRequestCard(data.xml, data.environment);
+        break;
+      // DVC-via-API only — the card ICCP returned. Shown once; the consultant
+      // copies it into Tramada/LastPass, and the agent never stores it.
+      case 'dvc_card_issued':
+        addDvcCardIssued(data.card);
+        break;
 
       case 'pipeline_progress':
         updateTramadaProgress(data.percent, data.message, data.runId);
@@ -1843,6 +1877,31 @@
       ${(h.notes || []).map(n => noteHtml(n, 'warn')).join('')}
       ${h.stop ? `<div class="payment-stop">${h.stop}</div>` : ''}
       ${h.back ? noteHtml(h.back) : ''}
+    `);
+  }
+
+  // The real outgoing SOAP request to Mastercard ICCP, shown as soon as it's
+  // built — proof of exactly what leaves this machine, not a paraphrase of it.
+  function addIccpRequestCard(xml, environment) {
+    paymentCard(`
+      <h3>Request sent to Mastercard ICCP (${esc(environment)})</h3>
+      <div class="payment-where">Signed with OAuth 1.0a (consumer key + .p12 key) — one signature per request.</div>
+      <pre class="iccp-request-xml">${esc(xml)}</pre>
+    `);
+  }
+
+  // The card ICCP returned. Shown once, in the clear, with an explicit note
+  // that this app does not store the full number or CVV anywhere past this —
+  // BR09 and the DVC guide's own "don't let the agent handle card numbers"
+  // note, enforced here rather than just in the handover text.
+  function addDvcCardIssued(card) {
+    paymentCard(`
+      <h3>&#128179; Card issued (${esc(card.environment)})</h3>
+      <div class="summary-row"><span class="label">Purchase request</span><span>${esc(card.purchaseRequestId)}</span></div>
+      <div class="summary-row"><span class="label">Card number</span><span class="mono">${esc(card.cardNumber)}</span></div>
+      <div class="summary-row"><span class="label">Expiry</span><span class="mono">${esc(card.expiry)}</span></div>
+      <div class="summary-row"><span class="label">CVV</span><span class="mono">${esc(card.cvv)}</span></div>
+      ${noteHtml('Copy this into the booking’s Tramada notes and your password manager now — it is not stored anywhere in this app and will not be shown again.', 'warn')}
     `);
   }
 
