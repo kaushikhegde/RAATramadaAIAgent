@@ -1161,6 +1161,13 @@
       case 'dvc_card_issued':
         addDvcCardIssued(data.card);
         break;
+      // DVC steps 16–18 — a real field for the supplier's payment reference
+      // instead of typing it into the chat box, so it can't be mistaken for a
+      // yes/no or a booking number, and the "RRC - " prefix is never re-typed
+      // by hand.
+      case 'dvc_reference_prompt':
+        addDvcReferencePrompt(data.bookingNo, data.supplier);
+        break;
 
       case 'pipeline_progress':
         updateTramadaProgress(data.percent, data.message, data.runId);
@@ -1904,6 +1911,79 @@
       ${noteHtml('Copy this into the booking’s Tramada notes and your password manager now — it is not stored anywhere in this app and will not be shown again.', 'warn')}
     `);
   }
+
+  // DVC steps 16–18. A real field, not the chat box — a mistyped chat line
+  // must never stand in for BR11's payment reference or get "RRC - " glued
+  // onto the wrong text, so this is its own input with its own Submit/Cancel,
+  // matching the login-fields card pattern (showTramadaPrompt) below.
+  //
+  // Each card gets its own instance id rather than one fixed id: on a retry
+  // after a failed write-back the server sends a second dvc_reference_prompt,
+  // and it needs to render as a fresh, enabled card rather than being silently
+  // dropped by a dedupe check against the first (now-disabled) one.
+  let dvcRefPromptSeq = 0;
+
+  function addDvcReferencePrompt(bookingNo, supplier) {
+    const cardId = `dvcRefPrompt_${++dvcRefPromptSeq}`;
+    const inputStyle =
+      'background:transparent;border:1px solid #555;color:inherit;padding:4px 6px;' +
+      'border-radius:4px;width:100%;max-width:200px;text-align:right;';
+    const wrapper = document.createElement('div');
+    wrapper.className = 'message bot';
+    wrapper.id = cardId;
+    wrapper.innerHTML = `
+      <div class="avatar">R</div>
+      <div>
+        <div class="summary-card payment-card">
+          <h3>&#128221; Payment reference — booking ${esc(bookingNo)}</h3>
+          <div class="payment-where">Once you've paid ${esc(supplier || 'the supplier')} with the Westpac DVC card, enter the
+            payment reference from their portal below. I'll add the &ldquo;RRC - &rdquo; prefix (BR11) and finish
+            steps 16&ndash;18 in Tramada myself.</div>
+          <div class="summary-row">
+            <span class="label">Payment reference</span>
+            <span><input id="${cardId}_input" type="text" placeholder="e.g. MG752045" style="${inputStyle}"
+              onkeydown="if(event.key==='Enter') submitDvcReference('${cardId}', '${esc(bookingNo)}')"></span>
+          </div>
+          <div style="display:flex; gap:8px; margin-top:10px;">
+            <button class="confirm-btn" onclick="submitDvcReference('${cardId}', '${esc(bookingNo)}')">&#9989; Finish in Tramada</button>
+            <button class="quick-reply-btn" onclick="cancelDvcReference('${cardId}', '${esc(bookingNo)}')">Cancel</button>
+          </div>
+        </div>
+      </div>
+    `;
+    chatContainer.appendChild(wrapper);
+    scrollToBottom();
+    const input = document.getElementById(`${cardId}_input`);
+    if (input) input.focus();
+  }
+
+  window.submitDvcReference = function (cardId, bookingNo) {
+    const input = document.getElementById(`${cardId}_input`);
+    const reference = ((input && input.value) || '').trim();
+    if (!reference) {
+      addBotMessage('&#10060; Enter the payment reference from the supplier’s portal first.');
+      return;
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      addBotMessage('&#10060; Not connected to server.');
+      return;
+    }
+    addUserMessage(`Payment reference: ${esc(reference)}`);
+    ws.send(JSON.stringify({ type: 'dvc_finish_reference', bookingNo, reference }));
+    const card = document.getElementById(cardId);
+    if (card) card.querySelectorAll('input, button').forEach((el) => (el.disabled = true));
+    isProcessing = true;
+    sendBtn.disabled = true;
+    showTypingIndicator();
+  };
+
+  window.cancelDvcReference = function (cardId, bookingNo) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    addUserMessage('Cancel');
+    ws.send(JSON.stringify({ type: 'dvc_cancel_reference', bookingNo }));
+    const card = document.getElementById(cardId);
+    if (card) card.querySelectorAll('input, button').forEach((el) => (el.disabled = true));
+  };
 
   function esc(v) {
     return String(v == null ? '' : v).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));

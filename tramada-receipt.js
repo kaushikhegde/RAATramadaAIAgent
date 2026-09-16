@@ -396,14 +396,70 @@ async function openReceiptForm(page, bookingNo, receipt) {
     { waitUntil: "domcontentloaded" }
   );
   await page.waitForSelector('input[value="Add / Issue Receipt"]', { timeout: 15000 });
+
+  // Some receipt types (DVC's "Agency CC Debtor Receipt") need the top-right
+  // dropdown set before "Add / Issue Receipt" is clicked, or the button opens
+  // whatever type the dropdown defaulted to instead. Mirrors the read side's
+  // openIssueForm in tramada-payment.js.
+  if (receipt.listOption) {
+    await page.evaluate((pattern) => {
+      const re = new RegExp(pattern, "i");
+      for (const sel of document.querySelectorAll("select")) {
+        const opt = Array.from(sel.options).find((o) => re.test(o.text));
+        if (opt) {
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event("change", { bubbles: true }));
+          break;
+        }
+      }
+    }, receipt.listOption);
+    await sleep(700);
+  }
+
   await page.click('input[value="Add / Issue Receipt"]');
   await page.waitForSelector("#receipttransactionTypeCode", { timeout: 20000 });
 
-  const txn = resolveTxnType(receipt.transactionType);
-
   // Transaction Type (req 2) — set first so credit-card sections render.
-  await page.selectOption("#receipttransactionTypeCode", txn);
-  await sleep(800);
+  //
+  // Skipped entirely when the caller passes `null`: DVC's "Agency CC Debtor
+  // Receipt" has no Transaction Type step (docs/Payments_Guide_-_DVC.md step
+  // 3 goes straight from the dropdown to Creditor — see tramada-payment.js's
+  // PAYMENT_FLOWS.dvc.transactionType comment). #receipttransactionTypeCode
+  // still resolves as an element on that page, but forcing "CC" into it there
+  // hung retrying a value/option that page's select doesn't have.
+  let txn = null;
+  if (receipt.transactionType !== null) {
+    txn = resolveTxnType(receipt.transactionType);
+    await page.selectOption("#receipttransactionTypeCode", txn);
+    await sleep(800);
+  }
+
+  // Creditor (DVC step 4) — who is being paid. This is a FRESH Issue Agency
+  // Credit Card Transaction form, not the one tramada-payment.js selected a
+  // creditor on while reading the booking, so it starts unselected here too
+  // and has to be set again. Matched by OPTION TEXT across every <select> on
+  // the form (same technique the receipt-type dropdown above uses) rather
+  // than by label, since a supplier name is not going to collide with an
+  // option in some other select on this page.
+  if (receipt.creditor) {
+    const re = String(receipt.creditor).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const chosen = await page.evaluate((pattern) => {
+      const rx = new RegExp(pattern, "i");
+      for (const sel of document.querySelectorAll("select")) {
+        const opt = Array.from(sel.options).find((o) => rx.test(o.text));
+        if (opt) {
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event("change", { bubbles: true }));
+          return opt.text.trim();
+        }
+      }
+      return null;
+    }, re);
+    if (!chosen) {
+      throw new Error(`Creditor "${receipt.creditor}" was not found on this receipt form.`);
+    }
+    await sleep(700);
+  }
 
   // Payer Name = booking client name (business rule, req: always client name).
   if (receipt.payerName) {
@@ -492,6 +548,35 @@ async function enterNewBookingCard(page, card) {
 }
 
 /**
+ * DVC step 16 — the Credit Card dropdown already has "Westpac DVC" as its one
+ * option (the card lives at Westpac, not saved to the client profile), so this
+ * only ever SELECTS, never creates one via enterNewBookingCard's "Add" popup.
+ */
+async function selectExistingCreditCard(page, { label, authNumber } = {}) {
+  const re = String(label || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const chosen = await page.evaluate((pattern) => {
+    const sel = document.getElementById("receiptcreditCard");
+    if (!sel) return null;
+    const re = new RegExp(pattern, "i");
+    const opt = Array.from(sel.options).find((o) => re.test(o.text));
+    if (!opt) return null;
+    sel.value = opt.value;
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    return opt.text.trim();
+  }, re);
+
+  if (!chosen) {
+    throw new Error(`Credit Card option "${label}" was not found in the dropdown.`);
+  }
+  await sleep(500);
+
+  if (authNumber) {
+    await page.fill("#receiptcreditCardAuthNumber", String(authNumber));
+  }
+  return chosen;
+}
+
+/**
  * Allocate the receipt across segments (req 3).
  *
  * @param {"ALL"|Array} allocation
@@ -562,6 +647,57 @@ async function allocateSegments(page, allocation, segments) {
       }
     }, seg.segId);
   }
+}
+
+/**
+ * Click #issue and wait for a definitive outcome: back on the receipts list
+ * (success), a Tramada error page, or on-form validation errors. A fixed sleep
+ * raced the server and produced false successes, so this polls instead.
+ * Returns the read-back receipt row. Throws if Issue did not actually commit —
+ * a real receipt number (R.000...) is the only thing that counts as success.
+ */
+async function clickIssueAndAwaitReceipt(page, bookingNo) {
+  await page.click("#issue");
+  for (let i = 0; i < 25; i++) {
+    await sleep(600);
+    const url = page.url();
+    if (/booking-receipts\.htm/i.test(url)) break; // back on the list → issued
+    const title = (await page.title().catch(() => "")) || "";
+    if (/error page/i.test(title)) {
+      throw new Error("Tramada returned a server error page after Issue.");
+    }
+    const errs = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll("a, span, li, font, div").forEach((n) => {
+        if (n.children.length) return;
+        const t = (n.textContent || "").trim();
+        if (t && t.length < 200 && /must be|is required|is invalid|cannot be/i.test(t)) out.push(t);
+      });
+      return [...new Set(out)].slice(0, 8);
+    }).catch(() => []);
+    if (errs.length) throw new Error(`Receipt rejected: ${errs.join("; ")}`);
+    if (i === 8) { try { await page.click("#issue", { timeout: 3000 }); } catch { /* busy */ } }
+  }
+
+  // Land on the Booking Receipts list and read back the new receipt.
+  if (!page.url().includes("booking-receipts")) {
+    await page.goto(
+      `${TRAMADA_BASE_URL}/booking/booking-receipts.htm?mode=edit&id=${encodeURIComponent(bookingNo)}`,
+      { waitUntil: "domcontentloaded" }
+    );
+    await sleep(800);
+  }
+  const issued = await readLatestReceipt(page);
+
+  // STRICT: success means a real receipt number (R.000...) in the list —
+  // anything else is a failure, never a silent "Receipt issued."
+  if (!issued || !/^R\./i.test(issued.receiptNo || "")) {
+    try { await page.screenshot({ path: "last-error.png", fullPage: true }); } catch { /* best-effort */ }
+    throw new Error(
+      "Receipt was NOT created — the receipts list shows no new receipt. [screenshot: last-error.png]"
+    );
+  }
+  return issued;
 }
 
 // Read back the top REAL receipt row after issuing — skips "No records found"
@@ -728,49 +864,7 @@ async function runTramadaReceipt({
     }
 
     onProgress(85, "Issuing receipt...");
-    // Real click on Issue, then WAIT for a definitive outcome: back on the
-    // receipts list (success), a Tramada error page, or on-form validation
-    // errors. A fixed sleep raced the server and produced false successes.
-    await page.click("#issue");
-    for (let i = 0; i < 25; i++) {
-      await sleep(600);
-      const url = page.url();
-      if (/booking-receipts\.htm/i.test(url)) break; // back on the list → issued
-      const title = (await page.title().catch(() => "")) || "";
-      if (/error page/i.test(title)) {
-        throw new Error("Tramada returned a server error page after Issue.");
-      }
-      const errs = await page.evaluate(() => {
-        const out = [];
-        document.querySelectorAll("a, span, li, font, div").forEach((n) => {
-          if (n.children.length) return;
-          const t = (n.textContent || "").trim();
-          if (t && t.length < 200 && /must be|is required|is invalid|cannot be/i.test(t)) out.push(t);
-        });
-        return [...new Set(out)].slice(0, 8);
-      }).catch(() => []);
-      if (errs.length) throw new Error(`Receipt rejected: ${errs.join("; ")}`);
-      if (i === 8) { try { await page.click("#issue", { timeout: 3000 }); } catch { /* busy */ } }
-    }
-
-    // Land on the Booking Receipts list and read back the new receipt.
-    if (!page.url().includes("booking-receipts")) {
-      await page.goto(
-        `${TRAMADA_BASE_URL}/booking/booking-receipts.htm?mode=edit&id=${encodeURIComponent(bookingNo)}`,
-        { waitUntil: "domcontentloaded" }
-      );
-      await sleep(800);
-    }
-    const issued = await readLatestReceipt(page);
-
-    // STRICT: success means a real receipt number (R.000...) in the list —
-    // anything else is a failure, never a silent "Receipt issued."
-    if (!issued || !/^R\./i.test(issued.receiptNo || "")) {
-      try { await page.screenshot({ path: "last-error.png", fullPage: true }); } catch { /* best-effort */ }
-      throw new Error(
-        "Receipt was NOT created — the receipts list shows no new receipt. [screenshot: last-error.png]"
-      );
-    }
+    const issued = await clickIssueAndAwaitReceipt(page, bookingNo);
 
     onProgress(100, `Receipt ${issued.receiptNo} issued.`);
     _ok = true;
@@ -785,6 +879,130 @@ async function runTramadaReceipt({
     } catch { /* tab may be closed */ }
     try {
       if (browser) await browser.close(); // CDP: only drops the connection
+    } catch { /* ignore */ }
+  }
+}
+
+/**
+ * DVC steps 16–18 — docs/Payments_Guide_-_DVC.md.
+ *
+ * Everything up to here (Westpac Submit / card creation, copying the card into
+ * Tramada notes, paying the supplier) is steps 13–15 and is either done via
+ * dvc-card-issuer.js or is a human action off-system. This is what comes back
+ * into Tramada once the consultant has that supplier payment reference:
+ *
+ *   1. Issue Agency Credit Card Transaction page, Credit Card = "Westpac DVC"
+ *      (an existing option — never a new card entered, unlike the other
+ *      receipt flows' enterNewBookingCard).
+ *   2. Authorisation Number = "XX6780" (BR-fixed placeholder, from the guide).
+ *   3. Payer Name = Cons1 (the consultant), Amount Received = Creditor Due.
+ *   4. Reference = "RRC - " + the supplier portal's payment reference (BR11)
+ *      — the caller must already have prefixed it; this function does not
+ *      add "RRC - " itself, so it works whether the caller reads BR11 or
+ *      step 16's literal (Tramada segment reference) text.
+ *   5. Select-all allocate, then Issue.
+ *
+ * No BR gates this write-back behind a human click the way BR07 (Westpac
+ * Submit) and BR10 (paying the supplier) do — so unlike those two, this one
+ * really does commit unless `dryRun` is set.
+ */
+async function issueDvcReceipt({
+  username,
+  password,
+  bookingNo,
+  supplier,
+  payerName,
+  amount,
+  reference,
+  authNumber = "XX6780",
+  creditCardLabel = "Westpac DVC",
+  dateReceived,
+  dryRun = false,
+  callbacks = {},
+} = {}) {
+  const onProgress = callbacks.onProgress || (() => {});
+  const onError = callbacks.onError || (() => {});
+
+  if (!bookingNo) throw new Error("bookingNo is required.");
+  if (!supplier) throw new Error("supplier (the Creditor) is required — DVC step 4.");
+  if (!reference) throw new Error("A reference is required (DVC BR11).");
+  if (amount == null || amount === "") throw new Error("An amount is required.");
+
+  let browser, context, page, launched = false;
+  let _ok = false;
+  try {
+    ({ browser, launched } = await openBrowser(onProgress));
+    context = browser.contexts()[0] || (await browser.newContext());
+    page = await context.newPage();
+
+    onProgress(12, "Checking Tramada session...");
+    await ensureLoggedIn(page, { username, password, onNeedLogin: callbacks.onNeedLogin });
+
+    onProgress(25, `Opening booking ${bookingNo}...`);
+    const details = await getBookingDetails(page, bookingNo);
+    const resolvedPayerName = payerName || details.payerName || details.clientName || "";
+
+    onProgress(45, "Opening Issue Agency Credit Card Transaction...");
+    const { segments } = await openReceiptForm(page, bookingNo, {
+      // No Transaction Type step on this page (guide step 3 goes straight to
+      // Creditor) — the whole receipt type is already credit-card-only.
+      transactionType: null,
+      // Step 3 — the dropdown Tramada's Add/Issue Receipt button reads before
+      // it opens the form; without this it can open whatever type it defaulted to.
+      listOption: "agency\\s*(cc|credit\\s*card)\\s*debtor\\s*receipt",
+      // Step 4 — this is a fresh form; it doesn't inherit the creditor
+      // tramada-payment.js selected while reading the booking.
+      creditor: supplier,
+      payerName: resolvedPayerName,
+      dateReceived,
+      amount,
+      reference,
+    });
+
+    onProgress(62, `Selecting ${creditCardLabel}...`);
+    await selectExistingCreditCard(page, { label: creditCardLabel, authNumber });
+
+    onProgress(75, "Allocating segments...");
+    await allocateSegments(page, "ALL", segments);
+    await sleep(400);
+
+    const staged = {
+      bookingNo: String(bookingNo),
+      creditor: supplier,
+      creditCard: creditCardLabel,
+      authNumber,
+      payerName: resolvedPayerName,
+      amount: String(amount),
+      reference: String(reference),
+      dateReceived: toTramadaDate(dateReceived),
+    };
+
+    if (dryRun) {
+      onProgress(90, "Preview ready — awaiting confirmation (not committed).");
+      let previewImage = null;
+      try {
+        previewImage = await page.screenshot({ encoding: "base64", fullPage: true });
+      } catch { /* screenshot optional */ }
+      onProgress(100, "Preview ready.");
+      _ok = true;
+      return { details, segments, staged, previewImage, committed: false };
+    }
+
+    onProgress(85, "Issuing receipt...");
+    const issued = await clickIssueAndAwaitReceipt(page, bookingNo);
+
+    onProgress(100, `Receipt ${issued.receiptNo} issued.`);
+    _ok = true;
+    return { details, segments, staged, receipt: issued, committed: true };
+  } catch (err) {
+    onError(err.message);
+    throw err;
+  } finally {
+    try {
+      if (page && _ok) await page.close();
+    } catch { /* tab may be closed */ }
+    try {
+      if (browser) await browser.close();
     } catch { /* ignore */ }
   }
 }
@@ -809,6 +1027,7 @@ async function searchBookingsForReceipt({ username, password, status, clientName
 
 module.exports = {
   runTramadaReceipt,
+  issueDvcReceipt,
   searchBookingsForReceipt,
   // exported for reuse/testing
   toTramadaDate,

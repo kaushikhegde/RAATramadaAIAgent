@@ -24,7 +24,7 @@ const { runJetstarBooking } = require("./booking");
 const { buildSystemPrompt, buildAssistantPrompt } = require("./geminiPrompt");
 const { runTramadaAutomation } = require("./tramada-automator");
 const { runTramadaAddAndSearch } = require("./tramada-booking");
-const { runTramadaReceipt, searchBookingsForReceipt } = require("./tramada-receipt");
+const { runTramadaReceipt, issueDvcReceipt, searchBookingsForReceipt } = require("./tramada-receipt");
 const { runFullBooking, runReadBookingState, runPdfBooking } = require("./tramada-segments");
 const { parseRaaItineraryBuffer } = require("./pdf-itinerary");
 const { runRoomResDraft, runRoomResQuote, closeRoomResPage } = require("./room-res-quote");
@@ -270,6 +270,16 @@ async function handleClientMessage(session, msg) {
       await handlePipelineRun(session, msg);
       break;
 
+    // DVC steps 16–18 — the payment-reference field on the dvc_reference_prompt
+    // card (not free-typed chat text — see handleDvcFinishReference's header).
+    case "dvc_finish_reference":
+      await handleDvcFinishReference(session, msg);
+      break;
+
+    case "dvc_cancel_reference":
+      handleDvcCancelReference(session, msg);
+      break;
+
     default:
       log("Unknown message type:", msg.type);
   }
@@ -493,6 +503,18 @@ async function handlePaymentsMessage(session, userText) {
     return;
   }
 
+  // A DVC card can outlive the in-memory pendingPayment that was tracking it
+  // — a server restart, most obviously — leaving a real, already-issued card
+  // with nothing to finish it off in Tramada. This re-reads the booking
+  // (read-only) and goes straight to the reference field, skipping validity/
+  // plan/CREATE CARD entirely so it can never issue a second card for a
+  // booking that already has a live one (BR08).
+  const resumeMatch = text.match(/^(?:finish|resume)\s+(\d{4,7})$/i);
+  if (resumeMatch) {
+    await resumeDvcWriteback(session, resumeMatch[1]);
+    return;
+  }
+
   // ── Step 0 — the transaction type, before anything else ──────────
   // Nothing below this point runs until it is answered, so a booking number
   // sent first is held rather than dropped, and the consultant does not have
@@ -641,7 +663,6 @@ async function handlePaymentsMessage(session, userText) {
     // a generic yes: this one actually calls Mastercard and creates a live
     // card, where "yes" everywhere else in this flow only ever displays text.
     if (session.paymentType.id === "dvc" && /^create\s*card$/i.test(text.trim())) {
-      session.pendingPayment = null;
       sendToClient(ws, {
         type: "bot_message",
         text: `Requesting the card from Mastercard ICCP for booking <b>${pending.bookingNo}</b>…`,
@@ -675,7 +696,23 @@ async function handlePaymentsMessage(session, userText) {
             `Tramada notes and your password manager now — I don't store them and won't show them again.`,
         });
         sendPaymentHandover(session, pending.payment, { plan: pending.plan, issuedCard: issued });
+
+        // Steps 14–15 (copying the card into Tramada notes, paying the
+        // supplier) are BR09/BR10 — a human's job, done off-system. Once
+        // that's done, all that's left to finish steps 16–18 ourselves is the
+        // supplier's payment reference — asked as its own field (not typed
+        // into the chat box) so it can't be mistaken for a yes/no or a
+        // booking number and doesn't need the "RRC - " prefix re-typed by hand.
+        pending.awaitingConfirm = false;
+        pending.awaitingDvcReference = true;
+        session.pendingPayment = pending;
+        sendToClient(ws, {
+          type: "dvc_reference_prompt",
+          bookingNo: pending.bookingNo,
+          supplier: pending.payment.supplier || null,
+        });
       } catch (err) {
+        session.pendingPayment = null;
         sendToClient(ws, {
           type: "error",
           text: `Card creation failed: ${err.message}. Nothing was charged or created — you can try again or use the manual Westpac-portal steps.`,
@@ -720,6 +757,21 @@ async function handlePaymentsMessage(session, userText) {
     return;
   }
 
+  // DVC steps 16–18 — the card is live and the reference is asked for as its
+  // own field on the dvc_reference_prompt card (handleDvcFinishReference),
+  // not typed here — a mistyped chat line must never stand in for BR11's
+  // reference or get "RRC - " glued onto the wrong thing. Anything that lands
+  // here while this is pending is a stray chat message, not the answer.
+  if (pending && pending.awaitingDvcReference) {
+    sendToClient(ws, {
+      type: "bot_message",
+      text:
+        `Use the <b>payment reference</b> field on the card above to finish booking ` +
+        `<b>${pending.bookingNo}</b> in Tramada — or its <b>Cancel</b> button to stop there.`,
+    });
+    return;
+  }
+
   // Awaiting a supplier choice from a multi-creditor booking.
   if (pending && pending.awaitingSupplier) {
     const { bookingNo, suppliers } = pending;
@@ -737,7 +789,11 @@ async function handlePaymentsMessage(session, userText) {
       return;
     }
     session.pendingPayment = null;
-    await runPaymentRead(session, bookingNo, chosen.text);
+    if (pending.resumeWriteback) {
+      await resumeDvcWriteback(session, bookingNo, chosen.text);
+    } else {
+      await runPaymentRead(session, bookingNo, chosen.text);
+    }
     return;
   }
 
@@ -755,6 +811,152 @@ async function handlePaymentsMessage(session, userText) {
   }
 
   await runPaymentRead(session, bookingNo, null);
+}
+
+/**
+ * "finish <bookingNo>" / "resume <bookingNo>" — picks a DVC write-back back up
+ * for a card that is already live but whose pendingPayment was lost (a server
+ * restart, most obviously). Re-reads the booking read-only and goes straight
+ * to the reference field: never validity, never the plan, never CREATE CARD,
+ * so this can't ever issue a second card for a booking that already has one
+ * (BR08). If the booking has more than one creditor, the caller is asked
+ * which one — same as a fresh read — before the reference field appears.
+ */
+async function resumeDvcWriteback(session, bookingNo, supplier) {
+  const { ws } = session;
+  const dvcType = PAYMENT_TYPES.find((t) => t.id === "dvc");
+  session.paymentType = dvcType;
+  session.pendingPayment = null;
+
+  sendToClient(ws, {
+    type: "bot_message",
+    text:
+      `Reading booking <b>${bookingNo}</b> to pick the Tramada write-back back up (steps 16–18) — ` +
+      `this won't create another card.`,
+  });
+
+  try {
+    const result = await readPaymentBooking({
+      flow: "dvc",
+      bookingNo,
+      supplier,
+      callbacks: {
+        onProgress: (pct, m) =>
+          session.active &&
+          sendToClient(ws, { type: "pipeline_progress", runId: `dvc-resume-${bookingNo}`, percent: pct, message: m }),
+      },
+    });
+
+    if (result.needsSupplierChoice) {
+      session.pendingPayment = { bookingNo, awaitingSupplier: true, suppliers: result.suppliers, resumeWriteback: true };
+      const list = result.suppliers.map((o, i) => `${i + 1}. ${esc(o.text)}`).join("<br>");
+      sendToClient(ws, {
+        type: "bot_message",
+        text:
+          `Booking <b>${bookingNo}</b> has ${result.suppliers.length} creditors — which one's card is this ` +
+          `finishing?<br><br>${list}`,
+      });
+      return;
+    }
+
+    session.pendingPayment = { bookingNo, payment: result, awaitingDvcReference: true };
+    sendToClient(ws, {
+      type: "dvc_reference_prompt",
+      bookingNo,
+      supplier: result.supplier || null,
+    });
+  } catch (err) {
+    sendToClient(ws, { type: "error", text: `Couldn't read booking ${bookingNo}: ${err.message}` });
+  }
+}
+
+/**
+ * DVC steps 16–18, triggered from the dvc_reference_prompt card's own field —
+ * see public/index.html's addDvcReferencePrompt / submitDvcReference. Kept as
+ * its own message type (not routed through the free-text handler above) so
+ * the reference can't be confused with a yes/no, a booking number, or any
+ * other thing typed into the main chat box while this is pending.
+ */
+async function handleDvcFinishReference(session, msg) {
+  const { ws } = session;
+  const pending = session.pendingPayment;
+
+  if (!pending || !pending.awaitingDvcReference || String(pending.bookingNo) !== String(msg.bookingNo)) {
+    sendToClient(ws, {
+      type: "error",
+      text: "That reference field isn't waiting on anything right now — nothing was sent to Tramada.",
+    });
+    return;
+  }
+
+  const typed = String(msg.reference || "").trim();
+  if (!typed) {
+    sendToClient(ws, { type: "error", text: "The payment reference field can't be empty (BR11)." });
+    return;
+  }
+
+  // BR11 — the "RRC - " prefix is Tramada's, not the supplier's; the field
+  // only ever collects the reference itself.
+  const reference = `RRC - ${typed}`;
+  sendToClient(ws, { type: "bot_message", text: `Submitted reference <b>${esc(reference)}</b> for booking <b>${pending.bookingNo}</b>.` });
+  sendToClient(ws, {
+    type: "bot_message",
+    text: `Finishing booking <b>${pending.bookingNo}</b> in Tramada — Westpac DVC, ref <b>${esc(reference)}</b>…`,
+  });
+  const runId = `dvc-writeback-${pending.bookingNo}-${Date.now().toString(36)}`;
+  try {
+    const result = await issueDvcReceipt({
+      bookingNo: pending.bookingNo,
+      supplier: pending.payment.supplier,
+      payerName: pending.payment.consultant,
+      amount: pending.payment.total,
+      reference,
+      callbacks: {
+        onProgress: (pct, m) =>
+          session.active && sendToClient(ws, { type: "pipeline_progress", runId, percent: pct, message: m }),
+      },
+    });
+    session.pendingPayment = null;
+    sendToClient(ws, {
+      type: "bot_message",
+      text:
+        `Done ✅ Receipt <b>${result.receipt.receiptNo}</b> issued in Tramada for booking ` +
+        `<b>${pending.bookingNo}</b> — ${result.receipt.amount}, ref ${result.receipt.reference}, ` +
+        `allocated ${result.receipt.allocated}.`,
+    });
+  } catch (err) {
+    // The card is already live — losing pendingPayment here would force a
+    // second "CREATE CARD" (a second real card, BR08) just to retry a form-
+    // filling bug. Re-show the same field instead so the reference can be
+    // resubmitted against the one card that already exists.
+    sendToClient(ws, {
+      type: "error",
+      text:
+        `Couldn't finish the Tramada receipt: ${err.message}. The card is still live and nothing else was ` +
+        `changed — try the reference again below, or finish steps 16–18 by hand.`,
+    });
+    sendToClient(ws, {
+      type: "dvc_reference_prompt",
+      bookingNo: pending.bookingNo,
+      supplier: pending.payment.supplier || null,
+    });
+  }
+}
+
+/** The dvc_reference_prompt card's Cancel button. */
+function handleDvcCancelReference(session, msg) {
+  const { ws } = session;
+  const pending = session.pendingPayment;
+  if (!pending || !pending.awaitingDvcReference || String(pending.bookingNo) !== String(msg.bookingNo)) return;
+
+  session.pendingPayment = null;
+  sendToClient(ws, {
+    type: "bot_message",
+    text:
+      `Stopped there — the card for booking <b>${pending.bookingNo}</b> is already live, but nothing was ` +
+      `written back into Tramada. Send the booking number again when you're ready to finish it, or do steps ` +
+      `16–18 by hand.`,
+  });
 }
 
 let paymentReadSeq = 0;
