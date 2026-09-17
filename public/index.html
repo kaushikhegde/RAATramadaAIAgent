@@ -286,6 +286,9 @@
     gap: 8px;
     transition: color .15s ease, background .15s ease;
   }
+  /* .tab-btn sets display:flex, which otherwise beats the `hidden` attribute's
+     built-in display:none (same-origin specificity tie broken by source order). */
+  .tab-btn[hidden] { display: none; }
   .tab-btn:hover { color: var(--raa-text); background: var(--raa-light-bg); }
   .tab-btn.active { color: var(--raa-text); border-bottom-color: var(--raa-yellow); }
   .tab-dot {
@@ -848,9 +851,11 @@
 </div>
 
 <div class="tab-bar" id="tabBar">
-  <button class="tab-btn active" data-tab="flights"  onclick="switchTab('flights')"><span class="tab-dot"></span>Flights<span class="tab-hint">Jetstar &rarr; Tramada</span></button>
-  <button class="tab-btn"        data-tab="tramada"  onclick="switchTab('tramada')"><span class="tab-dot"></span>Tramada<span class="tab-hint">Bookings, segments, receipts</span></button>
-  <button class="tab-btn"        data-tab="payments" onclick="switchTab('payments')"><span class="tab-dot"></span>Payments<span class="tab-hint">Creditor payments</span></button>
+  <!-- Flights and Tramada tabs hidden for now (not removed) — Payments is the
+       only tab in active use. Drop the `hidden` attribute to bring them back. -->
+  <button class="tab-btn" data-tab="flights"  onclick="switchTab('flights')" hidden><span class="tab-dot"></span>Flights<span class="tab-hint">Jetstar &rarr; Tramada</span></button>
+  <button class="tab-btn" data-tab="tramada"  onclick="switchTab('tramada')" hidden><span class="tab-dot"></span>Tramada<span class="tab-hint">Bookings, segments, receipts</span></button>
+  <button class="tab-btn active" data-tab="payments" onclick="switchTab('payments')"><span class="tab-dot"></span>Payments<span class="tab-hint">Creditor payments</span></button>
 </div>
 
 <div class="main-content">
@@ -953,12 +958,15 @@
     };
   }
 
-  let activeTab = 'flights';
+  // Flights/Tramada tabs are hidden for now (see the tab-bar markup) — default
+  // to the one visible tab so an early message (connectAll() runs before the
+  // switchTab('payments') call at the bottom) doesn't render into a hidden pane.
+  let activeTab = 'payments';
   // Which tab the code below is currently acting on. Equals activeTab for
   // anything the user just did; set to the originating tab while a background
   // socket's message is rendered, so its output lands in ITS transcript and not
   // in whichever tab happens to be on screen.
-  let renderTab = 'flights';
+  let renderTab = 'payments';
 
   const bind = (name, get, set) =>
     Object.defineProperty(window, name, { get, set, configurable: true });
@@ -1156,6 +1164,12 @@
       case 'iccp_request':
         addIccpRequestCard(data.xml, data.environment);
         break;
+      // Mint-via-API only — the exact JSON body sent to MintEFT's
+      // POST /transactions, shown at the moment it's built (before the
+      // response comes back) — same idea as iccp_request above.
+      case 'mint_request':
+        addMintRequestCard(data.body, data.environment);
+        break;
       // DVC-via-API only — the card ICCP returned. Shown once; the consultant
       // copies it into Tramada/LastPass, and the agent never stores it.
       case 'dvc_card_issued':
@@ -1167,6 +1181,12 @@
       // by hand.
       case 'dvc_reference_prompt':
         addDvcReferencePrompt(data.bookingNo, data.supplier);
+        break;
+      // Mint-via-API only — a human authorised it in MintEFT's own UI (BR02);
+      // this just surfaces the resulting transaction id, which the Tramada
+      // write-back has already used by the time this arrives.
+      case 'mint_payment_authorised':
+        addMintPaymentAuthorised(data.bookingNo, data.transactionId);
         break;
 
       case 'pipeline_progress':
@@ -1897,6 +1917,18 @@
     `);
   }
 
+  // Mint-via-API only — the exact JSON body sent to POST /transactions, shown
+  // before the response comes back. Reuses the ICCP request block's styling
+  // (a scrollable monospace pane) since the intent is identical: proof of what
+  // actually left this machine, not a paraphrase of it.
+  function addMintRequestCard(body, environment) {
+    paymentCard(`
+      <h3>Request sent to MintEFT (${esc(environment)})</h3>
+      <div class="payment-where">POST /transactions — Authorization: Bearer &lt;API key&gt;.</div>
+      <pre class="iccp-request-xml">${esc(JSON.stringify(body, null, 2))}</pre>
+    `);
+  }
+
   // The card ICCP returned. Shown once, in the clear, with an explicit note
   // that this app does not store the full number or CVV anywhere past this —
   // BR09 and the DVC guide's own "don't let the agent handle card numbers"
@@ -1909,6 +1941,17 @@
       <div class="summary-row"><span class="label">Expiry</span><span class="mono">${esc(card.expiry)}</span></div>
       <div class="summary-row"><span class="label">CVV</span><span class="mono">${esc(card.cvv)}</span></div>
       ${noteHtml('Copy this into the booking’s Tramada notes and your password manager now — it is not stored anywhere in this app and will not be shown again.', 'warn')}
+    `);
+  }
+
+  // Mint-via-API only — a human authorised it inside MintEFT's own UI (BR02),
+  // not here; this just shows the resulting transaction id, which is already
+  // on its way into Tramada's Reference field by the time this card appears.
+  function addMintPaymentAuthorised(bookingNo, transactionId) {
+    paymentCard(`
+      <h3>&#9989; Mint payment authorised</h3>
+      <div class="summary-row"><span class="label">Booking</span><span>${esc(bookingNo)}</span></div>
+      <div class="summary-row"><span class="label">Transaction ID</span><span class="mono">${esc(transactionId)}</span></div>
     `);
   }
 
@@ -1997,7 +2040,8 @@
   // messages — a payment authorised while the consultant is on another tab must
   // land in the Payments transcript, not be missed.
   connectAll();
-  switchTab('flights');
+  // Flights/Tramada tabs are hidden for now — default to the one visible tab.
+  switchTab('payments');
 </script>
 </body>
 </html>

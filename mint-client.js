@@ -141,6 +141,20 @@ function redact(body) {
 }
 
 /**
+ * Real Mint wraps the transaction under a `transaction` key on some endpoints
+ * (createPayment, getTransaction) and not others (the mock, always flat), and
+ * its `status` casing varies by endpoint too ("pending_for_authorisation" on
+ * create vs "PENDING_FOR_AUTHORISATION" on fetch). Every caller above this file
+ * — payment-events.js's poller above all — depends on one flat, lowercase-status
+ * shape, so that gets normalized here, once, rather than at every call site.
+ */
+function normalizeTransaction(resp) {
+  if (!resp) return resp;
+  const txn = resp.transaction && typeof resp.transaction === "object" ? resp.transaction : resp;
+  return txn.status ? { ...txn, status: String(txn.status).toLowerCase() } : txn;
+}
+
+/**
  * Create an UNAUTHORISED payment — BR02, expressed as code.
  *
  * `type` is a hardcoded literal, not a parameter, and not a variable read from
@@ -152,7 +166,7 @@ function redact(body) {
  * Returns Mint's transaction object; status will be pending_for_authorisation.
  */
 async function createPayment({ transaction, user, payer, payee }) {
-  return request("POST", "/transactions", {
+  const resp = await request("POST", "/transactions", {
     body: {
       transaction: { ...transaction, type: "create_payment" },
       user,
@@ -160,11 +174,13 @@ async function createPayment({ transaction, user, payer, payee }) {
       payee,
     },
   });
+  return normalizeTransaction(resp);
 }
 
 /** Current state of one transaction. This is what the poller calls against real Mint. */
 async function getTransaction(transactionId) {
-  return request("GET", `/transaction-by-id/${encodeURIComponent(transactionId)}`);
+  const resp = await request("GET", `/transaction-by-id/${encodeURIComponent(transactionId)}`);
+  return normalizeTransaction(resp);
 }
 
 /** Full status timeline — Mint's own audit trail, worth storing alongside ours. */
@@ -177,9 +193,24 @@ async function searchTransactions(filters = {}) {
   return request("GET", "/transaction_search", { query: filters });
 }
 
-/** Resolve a Tramada supplier name to a Mint payee (and its mint_company_number). */
-async function searchPayees(query) {
-  return request("GET", "/payee-search", { query: typeof query === "string" ? { name: query } : query });
+/**
+ * Resolve a Tramada supplier name to a Mint payee (and its mint_company_number).
+ *
+ * companyNumber is REQUIRED by Mint's own API — it's the requesting company's
+ * Mint number (RAA's own MINT_PAYER_COMPANY_NUMBER), not the payee's. Omitting
+ * it doesn't return an empty result, it 400s: "Required request parameter
+ * 'company_number' ... is not present".
+ */
+async function searchPayees({ companyNumber, payeeNameOrNumber, isSearchAll, page, size } = {}) {
+  return request("GET", "/payee-search", {
+    query: {
+      company_number: companyNumber,
+      payee_name_or_number: payeeNameOrNumber,
+      is_search_all: isSearchAll,
+      page,
+      size,
+    },
+  });
 }
 
 /** Abandon a staged payment the consultant rejected. */
@@ -196,6 +227,26 @@ function environment() {
   return "production";
 }
 
+/** Mirrors iccpClient.isConfigured() — mock never needs a real key. */
+function isConfigured() {
+  if (environment() === "mock") return true;
+  return Boolean(API_KEY);
+}
+
+// MintEFT's own UI (not the API) — confirmed by hand that its Pending Payments
+// page URL is stable and doesn't deep-link to a specific transaction (the URL
+// stayed the same through "Confirm Payment"). Still worth sending a consultant
+// straight there rather than nowhere. MINT_UI_PENDING_URL overrides outright;
+// otherwise the production guess mirrors the confirmed UAT one but has NOT
+// been verified — confirm it once production access exists.
+function pendingPaymentsUrl() {
+  if (process.env.MINT_UI_PENDING_URL) return process.env.MINT_UI_PENDING_URL;
+  const env = environment();
+  if (env === "uat") return "https://secure-uatsb.mintpayments.net/minteft/payments/pending";
+  if (env === "production") return "https://secure.mintpayments.com/minteft/payments/pending";
+  return null; // mock — there is no real UI to link to
+}
+
 module.exports = {
   createPayment,
   getTransaction,
@@ -204,6 +255,8 @@ module.exports = {
   searchPayees,
   cancelTransaction,
   environment,
+  isConfigured,
+  pendingPaymentsUrl,
   MintError,
   BASE_URL,
 };

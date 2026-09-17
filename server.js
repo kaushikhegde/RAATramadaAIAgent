@@ -30,10 +30,14 @@ const { parseRaaItineraryBuffer } = require("./pdf-itinerary");
 const { runRoomResDraft, runRoomResQuote, closeRoomResPage } = require("./room-res-quote");
 const { runRoomResToTramada, findTramadaClients, lookupBookingClient } = require("./room-res-tramada");
 const roomResChat = require("./roomres-chat");
-const { readPaymentBooking } = require("./tramada-payment");
+const { readPaymentBooking, issueCreditorPayment } = require("./tramada-payment");
 const paymentViews = require("./payment-views");
 const dvcCardIssuer = require("./dvc-card-issuer");
 const iccpClient = require("./iccp-client");
+const mintClient = require("./mint-client");
+const mintPaymentIssuer = require("./mint-payment-issuer");
+const paymentEvents = require("./payment-events");
+const paymentsStore = require("./payments-store");
 
 // ─── Config ──────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
@@ -673,10 +677,9 @@ async function handlePaymentsMessage(session, userText) {
           plan: pending.plan,
           confirm: "CREATE CARD",
           consultantEmail: pending.payment.consultant || null,
-          // dvc-card-issuer.js supports an onRequestBuilt(xml) callback that
-          // surfaces the raw outgoing SOAP request — useful for a proof/debug
-          // session, too technical for day-to-day use, so left disconnected
-          // here rather than removed. Wire it back in if that's needed again.
+          // The real outgoing SOAP request, shown before the response comes
+          // back — proof of exactly what leaves this machine, not a paraphrase.
+          onRequestBuilt: (xml) => sendToClient(ws, { type: "iccp_request", xml, environment: iccpClient.environment() }),
         });
         sendToClient(ws, {
           type: "dvc_card_issued",
@@ -718,6 +721,14 @@ async function handlePaymentsMessage(session, userText) {
           text: `Card creation failed: ${err.message}. Nothing was charged or created — you can try again or use the manual Westpac-portal steps.`,
         });
       }
+      return;
+    }
+
+    // Mint only, and only this exact literal — see the quick-reply text above
+    // for why "SEND TO MINT" has to be its own confirmation rather than a
+    // generic yes.
+    if (session.paymentType.id === "mint" && /^send\s*to\s*mint$/i.test(text.trim())) {
+      await beginMintStaging(session, pending);
       return;
     }
 
@@ -769,6 +780,30 @@ async function handlePaymentsMessage(session, userText) {
         `Use the <b>payment reference</b> field on the card above to finish booking ` +
         `<b>${pending.bookingNo}</b> in Tramada — or its <b>Cancel</b> button to stop there.`,
     });
+    return;
+  }
+
+  // Mint's payee list came back with more than one match for the Tramada
+  // supplier name (mock-mint-server.js seeds deliberate near-duplicates for
+  // exactly this reason) — never guess, ask which one.
+  if (pending && pending.awaitingMintPayeeChoice) {
+    const candidates = pending.mintPayeeCandidates || [];
+    const byIndex = /^\d+$/.test(text) ? candidates[Number(text) - 1] : null;
+    const chosen =
+      byIndex ||
+      candidates.find((c) => c.name.toLowerCase() === text.toLowerCase()) ||
+      candidates.find((c) => c.name.toLowerCase().includes(text.toLowerCase()));
+
+    if (!chosen) {
+      sendToClient(ws, {
+        type: "bot_message",
+        text: `I couldn't match "${esc(text)}" to a Mint payee. Reply with the number from the list, or the payee name.`,
+      });
+      return;
+    }
+    pending.awaitingMintPayeeChoice = false;
+    pending.mintPayeeCandidates = null;
+    await stageMintPayment(session, pending, chosen);
     return;
   }
 
@@ -959,6 +994,237 @@ function handleDvcCancelReference(session, msg) {
   });
 }
 
+/* ── Mint: stage via the API, then a background watch to authorisation ──── */
+
+// Only while a live chat is actively waiting on a given payment — the actual
+// completion (below) never depends on this being populated, since the
+// consultant will not still have the chat open when Mint's authorisation
+// lands (payments-store.js's own header).
+const mintChatWatchers = new Map(); // payment record id -> session
+
+/**
+ * "SEND TO MINT" — resolve the Mint payee first. Never guessed: mock-mint-
+ * server.js seeds deliberate near-duplicate payee names for exactly this
+ * reason, so an ambiguous match is asked about, not picked.
+ */
+async function beginMintStaging(session, pending) {
+  const { ws } = session;
+  let resolved;
+  try {
+    resolved = await mintPaymentIssuer.resolvePayee(pending.payment.supplier);
+  } catch (err) {
+    // A payee-search failure (Mint unreachable, a bad key, a 500) must never
+    // leave the chat hanging on "typing" forever — handleClientMessage is
+    // fired without awaiting it, so an exception here has nothing above it
+    // to catch otherwise.
+    sendToClient(ws, {
+      type: "error",
+      text: `Couldn't reach Mint to look up the payee: ${err.message}. Nothing was staged — try again, or reply <b>Yes</b> for the manual mapping instead.`,
+    });
+    return;
+  }
+
+  if (resolved.error) {
+    sendToClient(ws, {
+      type: "bot_message",
+      text: `${esc(resolved.error)} Reply <b>Yes</b> for the manual mapping instead, or fix it in Mint and try again.`,
+    });
+    return;
+  }
+  if (resolved.candidates) {
+    pending.awaitingConfirm = false;
+    pending.awaitingMintPayeeChoice = true;
+    pending.mintPayeeCandidates = resolved.candidates;
+    const list = resolved.candidates
+      .map((c, i) => `${i + 1}. ${esc(c.name)} (${esc(c.mint_company_number)})`)
+      .join("<br>");
+    sendToClient(ws, {
+      type: "bot_message",
+      text:
+        `Mint has ${resolved.candidates.length} payees matching "${esc(pending.payment.supplier)}" — ` +
+        `which one is this?<br><br>${list}`,
+    });
+    return;
+  }
+
+  await stageMintPayment(session, pending, resolved.payee);
+}
+
+/**
+ * Stage the payment, then hand off to the background watcher. This does NOT
+ * block on the human's MintEFT authorisation — that could take hours — so the
+ * chat is told to expect an update later rather than left waiting.
+ */
+async function stageMintPayment(session, pending, payee) {
+  const { ws } = session;
+  sendToClient(ws, {
+    type: "bot_message",
+    text: `Staging booking <b>${pending.bookingNo}</b> with Mint (payee <b>${esc(payee.name)}</b>)…`,
+  });
+
+  let staged;
+  try {
+    staged = await mintPaymentIssuer.stagePayment({
+      result: pending.payment,
+      payee,
+      consultantEmail: pending.payment.consultant || null,
+      // Same idea as dvc-card-issuer.js's onRequestBuilt for the ICCP SOAP
+      // request — the real outgoing JSON body, shown before the response
+      // comes back, not a paraphrase of it.
+      onRequestBuilt: (body) => sendToClient(ws, { type: "mint_request", body, environment: mintClient.environment() }),
+    });
+  } catch (err) {
+    session.pendingPayment = null;
+    if (err.code === "DUPLICATE_PAYMENT") {
+      sendToClient(ws, {
+        type: "error",
+        text:
+          `Booking <b>${esc(pending.bookingNo)}</b> already has a payment for this reference — ` +
+          `${esc(err.existing.id)} (${esc(err.existing.status)}). Nothing new was sent to Mint.`,
+      });
+    } else {
+      sendToClient(ws, { type: "error", text: `Mint staging failed: ${err.message}. Nothing was created.` });
+    }
+    return;
+  }
+
+  session.pendingPayment = null;
+  mintChatWatchers.set(staged.record.id, session);
+
+  const pendingUrl = mintClient.pendingPaymentsUrl();
+  sendToClient(ws, {
+    type: "bot_message",
+    text:
+      `Staged with Mint — transaction <b>${esc(staged.transaction.transaction_id)}</b>, status ` +
+      `<b>${esc(staged.transaction.status)}</b>. Go authorise it inside MintEFT's own UI (BR02)` +
+      (pendingUrl
+        ? ` — <a href="${esc(pendingUrl)}" target="_blank" rel="noopener">open Pending Payments</a>`
+        : "") +
+      ` — I'll update this chat and finish the Tramada write-back automatically once you do, even if you close ` +
+      `this window first.`,
+  });
+
+  startWatchingMintPayment(staged.record.id);
+}
+
+/**
+ * Runs independent of any chat session — driven entirely off payments-store.js
+ * so a payment authorised after the consultant has closed the chat (or the
+ * server restarted) still gets written back into Tramada.
+ */
+function startWatchingMintPayment(paymentId) {
+  const record = paymentsStore.get(paymentId);
+  if (!record || !record.mintTransactionId) return;
+
+  paymentEvents.watchTransaction(record.mintTransactionId, {
+    onStatusChange: (status, txn) => {
+      onMintStatusChange(paymentId, status, txn).catch((err) =>
+        log("onMintStatusChange failed for", paymentId, err.message)
+      );
+    },
+    onError: (err, meta) => {
+      if (meta && meta.transient) return; // logged inside payment-events.js already
+      paymentsStore.update(paymentId, {}, { event: "mint_watch_gave_up", detail: err.message, actor: "agent" });
+    },
+  });
+}
+
+async function onMintStatusChange(paymentId, status) {
+  const record = paymentsStore.get(paymentId);
+  if (!record) return;
+  const session = mintChatWatchers.get(paymentId);
+  mintChatWatchers.delete(paymentId);
+  const liveWs = session && session.active ? session.ws : null;
+
+  if (status !== "authorised") {
+    paymentsStore.update(paymentId, { mintStatus: status, status }, {
+      event: `mint_${status}`,
+      detail: `Mint transaction ${record.mintTransactionId} moved to ${status} — nothing written back to Tramada.`,
+      actor: "mint",
+    });
+    if (liveWs) {
+      sendToClient(liveWs, {
+        type: "bot_message",
+        text:
+          `Mint transaction <b>${esc(record.mintTransactionId)}</b> for booking <b>${esc(record.bookingNo)}</b> ` +
+          `was <b>${esc(status)}</b> — nothing written back to Tramada.`,
+      });
+    }
+    return;
+  }
+
+  paymentsStore.update(paymentId, { mintStatus: status, status: "authorised" }, {
+    event: "mint_authorised",
+    detail: `Mint transaction ${record.mintTransactionId} authorised — continuing to Tramada write-back.`,
+    actor: "mint",
+  });
+
+  if (liveWs) {
+    sendToClient(liveWs, {
+      type: "mint_payment_authorised",
+      bookingNo: record.bookingNo,
+      transactionId: record.mintTransactionId,
+    });
+    sendToClient(liveWs, {
+      type: "bot_message",
+      text:
+        `Mint authorised the payment — transaction <b>${esc(record.mintTransactionId)}</b>. Finishing booking ` +
+        `<b>${esc(record.bookingNo)}</b> in Tramada now…`,
+    });
+  }
+
+  const runId = `mint-writeback-${record.bookingNo}-${Date.now().toString(36)}`;
+  try {
+    const result = await issueCreditorPayment({
+      flow: "mint",
+      bookingNo: record.bookingNo,
+      supplier: record.supplierName,
+      payerName: record.passengerName,
+      amount: record.amount,
+      reference: record.mintTransactionId,
+      callbacks: {
+        onProgress: (pct, m) =>
+          liveWs && sendToClient(liveWs, { type: "pipeline_progress", runId, percent: pct, message: m }),
+      },
+    });
+    paymentsStore.update(paymentId, { status: "recorded" }, {
+      event: "mint_recorded",
+      detail: result.verified
+        ? `Tramada write-back submitted for reference ${record.mintTransactionId}.`
+        : `Tramada write-back submitted but could not be positively confirmed from the page — check Tramada.`,
+      actor: "agent",
+    });
+    if (liveWs) {
+      sendToClient(liveWs, {
+        type: "bot_message",
+        text: result.verified
+          ? `Done ✅ Booking <b>${esc(record.bookingNo)}</b> finished in Tramada with reference <b>${esc(record.mintTransactionId)}</b>.`
+          : `Submitted booking <b>${esc(record.bookingNo)}</b>'s payment in Tramada with reference ` +
+            `<b>${esc(record.mintTransactionId)}</b>, but I couldn't positively confirm it from the page — ` +
+            `check Tramada's Payments list before relying on it.`,
+      });
+    }
+  } catch (err) {
+    // The Mint transaction is already authorised — stay "authorised" rather
+    // than "failed" so this is retryable, same reasoning as the DVC write-back
+    // failure path.
+    paymentsStore.update(paymentId, { status: "authorised" }, {
+      event: "mint_writeback_failed",
+      detail: err.message,
+      actor: "agent",
+    });
+    if (liveWs) {
+      sendToClient(liveWs, {
+        type: "error",
+        text:
+          `Mint authorised the payment (transaction ${esc(record.mintTransactionId)}) but the Tramada write-back ` +
+          `failed: ${err.message}. Finish it by hand in Tramada — Reference ${esc(record.mintTransactionId)}, ` +
+          `amount ${esc(record.amount)}.`,
+      });
+    }
+  }
+}
+
 let paymentReadSeq = 0;
 
 async function runPaymentRead(session, bookingNo, supplier) {
@@ -1057,6 +1323,30 @@ async function runPaymentRead(session, bookingNo, supplier) {
           `<b>$${Number(result.total || 0).toFixed(2)}</b> across ${result.segments.length} ` +
           `segment${result.segments.length === 1 ? "" : "s"}.`
       );
+      return;
+    }
+
+    // Mint steps 1–6, concluded: the mapped payment entity, shown as its own
+    // card the moment the read finishes — the same moment DVC's Westpac plan
+    // appears.
+    const mintApiConfigured = type.id === "mint" && mintClient.isConfigured();
+    if (type.id === "mint") {
+      const plan = paymentViews.mintPlanView(result);
+      pending.plan = plan;
+      sendToClient(ws, { type: "payment_plan", plan });
+    }
+
+    // Mint, API configured: no confirmation click in front of this — staging
+    // (type "create_payment") never moves money and is structurally incapable
+    // of authorising one (BR02, enforced in mint-client.js), so the real
+    // human-in-the-loop gate is MintEFT's own authorisation click, not a
+    // second click here. Steps 1–6 having just run is the trigger; the
+    // automation continues straight into building and sending the request.
+    // awaitingConfirm stays open underneath as the retry/manual-fallback
+    // surface if resolvePayee or the API call itself fails.
+    if (mintApiConfigured) {
+      pending.awaitingConfirm = true;
+      await beginMintStaging(session, pending);
       return;
     }
 
@@ -2399,5 +2689,14 @@ server.listen(PORT, async () => {
     console.log("   Start it before triggering automation:");
     console.log("     npm run start:chrome");
     console.log("   First run: manually browse jetstar.com once in that window to warm cookies.\n");
+  }
+
+  // Payments staged with Mint before the last restart are exactly what the
+  // poller has to pick back up (payments-store.js's own header) — nobody will
+  // still have chat open by the time a human authorises them.
+  const awaitingMint = paymentsStore.listAwaiting().filter((r) => r.provider === "mint" && r.mintTransactionId);
+  if (awaitingMint.length) {
+    console.log(`🔄 Resuming ${awaitingMint.length} Mint payment(s) awaiting authorisation...`);
+    for (const record of awaitingMint) startWatchingMintPayment(record.id);
   }
 });

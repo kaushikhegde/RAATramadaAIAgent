@@ -268,10 +268,21 @@ app.post("/eft/v1/cancel/transactions", (req, res) => {
 
 // ─── GET /eft/v1/payee-search ────────────────────────────────────
 app.get("/eft/v1/payee-search", (req, res) => {
-  const q = String(req.query.name || req.query.q || "").trim().toLowerCase();
+  // Mirrors real Mint's contract exactly: company_number is REQUIRED (the
+  // requesting company's own Mint number), not a filter on the payee itself —
+  // see mint-client.js's searchPayees.
+  if (!req.query.company_number) {
+    return res.status(400).json({
+      error_code: "bad_request",
+      error_message: "Required request parameter 'company_number' for method parameter type String is not present",
+      request_uri: "/minteft/v1/payee-search",
+      timestamp_utc: new Date().toISOString(),
+    });
+  }
+  const q = String(req.query.payee_name_or_number || "").trim().toLowerCase();
   const db = readDb();
   const results = q
-    ? db.payees.filter((p) => p.name.toLowerCase().includes(q) || tokenOverlap(p.name, q))
+    ? db.payees.filter((p) => p.name.toLowerCase().includes(q) || p.mint_company_number.toLowerCase() === q || tokenOverlap(p.name, q))
     : db.payees;
   res.status(200).json({ payees: results, response_code: "200", response_message: "Success" });
 });

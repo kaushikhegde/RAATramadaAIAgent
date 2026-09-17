@@ -330,6 +330,66 @@ function dvcPlanView(result, answers = {}, today = new Date()) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
+ * View 2b — the Mint payment entity (steps 1–6's result, mapped and ready)
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Mint steps 1–6, concluded: exactly what those Tramada steps produced, mapped
+ * onto MintEFT's own field names — the payment entity that is ready to become
+ * either a real API request (mint-payment-issuer.js's buildTransactionFields,
+ * once a payee is resolved) or the manual MintEFT form (mintHandover below).
+ * Shown right after the read, before any confirmation is asked — same moment
+ * DVC's plan appears, and for the same reason: the consultant should see the
+ * mapping BEFORE deciding what to do with it, not only after committing to
+ * SEND TO MINT.
+ */
+function mintPlanView(result) {
+  const warnings = [];
+  const ref = firstReference(result);
+
+  const customFields = [
+    {
+      label: "Recipient Reference",
+      value: ref ? referenceToken(ref) : null,
+      source: "Segments to Allocate → Reference",
+    },
+    { label: "Sender Reference", value: String(result.bookingNo || ""), source: "Booking Number" },
+    { label: "Passenger Name", value: lastName(result.clientName), source: "Client Name" },
+    { label: "Total Amount", value: money(result.total), source: "Creditor Payable" },
+    { label: "Payment Date", value: fmtDate(new Date()), source: "today" },
+    {
+      label: "Payee Name or Number",
+      value: result.supplier,
+      source: 'Payment To — resolved against Mint\'s own payee list when staged',
+    },
+  ];
+
+  const missing = customFields.filter((f) => !f.value).map((f) => f.label);
+  if (missing.length) {
+    warnings.push(
+      `Missing from the Tramada booking: <b>${missing.join(", ")}</b>. BR01 says raise it with a human ` +
+        `and fill in the rest — don't submit the request with them blank.`
+    );
+  }
+  if (!ref) {
+    warnings.push(
+      `No reference on the segment. BR01 says raise it with a human and continue to populate the ` +
+        `remainder of the fields.`
+    );
+  }
+
+  return {
+    title: `MintEFT "Create New Payment" for booking ${result.bookingNo}`,
+    rows: [
+      ["Transaction Type", "EFT"],
+      ["Payment To", result.supplier],
+    ].filter(([, v]) => v != null && v !== ""),
+    customFields,
+    warnings,
+  };
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
  * View 3 — the hand-off
  * ──────────────────────────────────────────────────────────────────────── */
 
@@ -533,6 +593,7 @@ function handoverView(result, extra = {}) {
 module.exports = {
   summaryView,
   dvcPlanView,
+  mintPlanView,
   handoverView,
   // exported for the tests and the chat's own formatting
   parseDate,

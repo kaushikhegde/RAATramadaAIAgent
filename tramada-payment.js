@@ -287,6 +287,15 @@ async function findSelectByLabel(page, labelPattern) {
       if (el.id) {
         const lab = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
         if (lab && re.test(lab.textContent)) return true;
+        // Tramada's own markup bug: some fields' `for` carries the underlying
+        // dotted field NAME (e.g. "payment.transactionTypeCode"), not the
+        // element's actual id (dots stripped: "paymenttransactionTypeCode") —
+        // so the exact selector above never matches. Compare with dots
+        // stripped from both sides as a fallback before giving up on id.
+        const idNoDots = el.id.replace(/\./g, "");
+        for (const l of document.querySelectorAll("label[for]")) {
+          if (l.getAttribute("for").replace(/\./g, "") === idNoDots && re.test(l.textContent)) return true;
+        }
       }
       const cell = el.closest("td");
       const prev = cell && cell.previousElementSibling;
@@ -706,9 +715,276 @@ function readCreditorPayment(opts = {}) {
   return readPaymentBooking({ ...opts, flow: opts.flow || "mint" });
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+ * The write-back (Mint steps 12–15 / TravelPay steps 9–11)
+ * ─────────────────────────────────────────────────────────────────────────
+ * UNVERIFIED, same category as this file's own header note on the Payments
+ * page selectors: nobody has inspected the Issue Creditor Payment form, so
+ * this is written the same way the rest of this module is — located by LABEL
+ * and BUTTON TEXT, never by assumed id, and it fails loudly rather than
+ * claiming a silent success it cannot prove. Run with dryRun first against a
+ * real booking (or probe-payment-page.js) before trusting this in production;
+ * this pattern (openTransactionPage → openIssueForm → fill by label) is the
+ * one already proven for the read side above.
+ */
+
+/** Fill a text <input> located by its adjacent label text — the write-side
+ * counterpart to findSelectByLabel, for fields the read never had to touch
+ * (Reference, Payee Name, Amount to pay). */
+async function fillFieldByLabel(page, labelPattern, value) {
+  if (value == null || value === "") return false;
+  return await page.evaluate(
+    ({ pattern, value }) => {
+      const re = new RegExp(pattern, "i");
+      // MUST be <label> elements only, not "any leaf anywhere in body" — the
+      // left nav's "References" link and a table's "Reference" <th> both
+      // match /reference/i too, and being earlier in the DOM than the real
+      // form label, a body-wide leaf search walks forward from THOSE instead
+      // and fills whatever input happens to come next (once landed a Mint
+      // transaction id in a hidden bank-account field instead of Reference).
+      const leaves = Array.from(document.querySelectorAll("label")).filter((n) =>
+        re.test((n.textContent || "").trim())
+      );
+      for (const lb of leaves) {
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+        walker.currentNode = lb;
+        let n;
+        while ((n = walker.nextNode())) {
+          if (n.tagName === "INPUT" && (!n.type || /^(text|number)$/i.test(n.type))) {
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+            setter.call(n, value);
+            n.dispatchEvent(new Event("input", { bubbles: true }));
+            n.dispatchEvent(new Event("change", { bubbles: true }));
+            n.dispatchEvent(new Event("blur", { bubbles: true }));
+            return true;
+          }
+        }
+      }
+      return false;
+    },
+    { pattern: labelPattern, value: String(value) }
+  );
+}
+
+/**
+ * Tick every allocatable row using the EXACT element ids readSegmentsToAllocate
+ * already found on this page (not tramada-receipt.js's #allocationAmount_
+ * convention, which is unconfirmed here), then click Issue.
+ */
+async function allocateAllAndIssue(page, allocation) {
+  if (!allocation.found || !allocation.rows.length) {
+    throw new Error("No costed segments to allocate against on the Issue Creditor Payment form.");
+  }
+
+  await page.evaluate((rows) => {
+    for (const r of rows) {
+      if (r.checkboxId) {
+        const cb = document.getElementById(r.checkboxId);
+        if (cb && !cb.checked) {
+          cb.checked = true;
+          cb.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      }
+      if (r.amountInputId) {
+        const inp = document.getElementById(r.amountInputId);
+        if (inp && !parseFloat(inp.value || "0")) {
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+          const due = (r.amountText || "").replace(/[^0-9.]/g, "");
+          if (due) {
+            setter.call(inp, due);
+            inp.dispatchEvent(new Event("input", { bubbles: true }));
+            inp.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+        }
+      }
+    }
+  }, allocation.rows);
+  await sleep(500);
+
+  const issueBtn = page.locator('input[value*="Issue" i], button:has-text("Issue")').first();
+  if (!(await issueBtn.count())) {
+    throw new Error(
+      'Could not find an "Issue" button on the Issue Creditor Payment form. ' +
+        'Run "node probe-payment-page.js <bookingNo> --flow mint" to capture the real button.'
+    );
+  }
+  const beforeUrl = page.url();
+  await issueBtn.click();
+  await sleep(1500);
+
+  // Same validation-error sweep clickIssueAndAwaitReceipt uses in
+  // tramada-receipt.js — the one thing worth reusing that pattern for, since a
+  // rejected form is unambiguous regardless of which page it happened on.
+  const errs = await page
+    .evaluate(() => {
+      const out = [];
+      document.querySelectorAll("a, span, li, font, div").forEach((n) => {
+        if (n.children.length) return;
+        const t = (n.textContent || "").trim();
+        if (t && t.length < 200 && /must be|is required|is invalid|cannot be/i.test(t)) out.push(t);
+      });
+      return [...new Set(out)].slice(0, 8);
+    })
+    .catch(() => []);
+  if (errs.length) throw new Error(`Payment rejected: ${errs.join("; ")}`);
+
+  // No confirmed success signal exists for this page (unlike the Receipts
+  // list's "R.000..." row) — say so honestly rather than claiming certainty.
+  // Navigating away with no validation errors is the best available signal.
+  const verified = page.url() !== beforeUrl;
+  return { verified };
+}
+
+/**
+ * Mint steps 12–15 (and, structurally, TravelPay's equivalent) — paste the
+ * external reference into a FRESH Issue Creditor Payment form and finish it.
+ * A fresh form because this runs long after the read: it does not inherit the
+ * Transaction Type or supplier tramada-payment.js's read selected earlier, so
+ * both are set again here exactly as the read set them.
+ *
+ * @param {object} args
+ * @param {string} [args.flow="mint"]
+ * @param {string|number} args.bookingNo
+ * @param {string} args.supplier   the creditor (Payment To / Payee)
+ * @param {string} args.reference  the external system's transaction id — Mint's
+ *                                 M00XXXXXX, pasted in VERBATIM (no prefix; see
+ *                                 docs/Payments_Guide_MINT.md step 12)
+ * @param {number|string} args.amount
+ * @param {string} [args.payerName]  defaults to the booking's client name —
+ *                                   Mint step 13 says "Payee Name as per Client
+ *                                   Name", unlike DVC's write-back which uses
+ *                                   the consultant
+ * @param {boolean} [args.dryRun=false]
+ * @param {object} [args.callbacks]  { onProgress(pct,msg), onNeedLogin() }
+ */
+async function issueCreditorPayment({
+  flow: flowName = "mint",
+  username,
+  password,
+  bookingNo,
+  supplier,
+  reference,
+  amount,
+  payerName,
+  dryRun = false,
+  callbacks = {},
+} = {}) {
+  const onProgress = callbacks.onProgress || (() => {});
+
+  if (!bookingNo) throw new Error("bookingNo is required.");
+  if (!supplier) throw new Error("supplier (the Payment To / Creditor) is required.");
+  if (!reference) throw new Error("A reference is required (BR01/step 12).");
+  if (amount == null || amount === "") throw new Error("An amount is required.");
+
+  const flow = getFlow(flowName);
+
+  let browser, context, page, launched = false;
+  try {
+    ({ browser, launched } = await openBrowser(onProgress));
+    context = browser.contexts()[0] || (await browser.newContext());
+    page = await context.newPage();
+
+    onProgress(10, "Checking Tramada session...");
+    await ensureLoggedIn(page, { username, password, onNeedLogin: callbacks.onNeedLogin });
+
+    onProgress(20, `Opening booking ${bookingNo}...`);
+    const details = await getBookingDetails(page, bookingNo);
+    const resolvedPayerName = payerName || details.clientName || details.client || "";
+
+    onProgress(35, `Opening Booking ${flow.navText}...`);
+    await openTransactionPage(page, bookingNo, flow);
+
+    onProgress(45, `Opening the ${flow.label} form...`);
+    await openIssueForm(page, flow);
+
+    if (flow.transactionType) {
+      onProgress(55, "Setting transaction type...");
+      const txnSelect = await findSelectByLabel(page, "transaction\\s*type");
+      if (txnSelect) {
+        await setSelectByText(page, txnSelect, flow.transactionType);
+        await sleep(900);
+      }
+    }
+
+    if (flow.supplierLabel) {
+      onProgress(62, `Selecting ${supplier}...`);
+      const payToSelect = await findSelectByLabel(page, flow.supplierLabel);
+      const chosen = payToSelect ? await setSelectByText(page, payToSelect, escapeRe(supplier)) : null;
+      if (!chosen) {
+        throw new Error(
+          `Supplier "${supplier}" is not in the ${flow.label} creditor list for booking ${bookingNo}.`
+        );
+      }
+      await sleep(900);
+    }
+
+    onProgress(72, "Filling in the payment details...");
+    await fillFieldByLabel(page, "payee\\s*name|payer\\s*name", resolvedPayerName);
+    await fillFieldByLabel(page, "reference", String(reference));
+    await fillFieldByLabel(page, "amount", String(amount));
+
+    onProgress(85, "Reading segments to allocate...");
+    const allocation = await readSegmentsToAllocate(page, flow);
+
+    if (dryRun) {
+      onProgress(90, "Preview ready — awaiting confirmation (not committed).");
+      let previewImage = null;
+      try {
+        previewImage = await page.screenshot({ encoding: "base64", fullPage: true });
+      } catch {
+        /* screenshot optional */
+      }
+      // Raw field dump — same spirit as probe-payment-page.js: when a fill or a
+      // select silently no-ops, seeing the ACTUAL labels/options/ids the live
+      // page has beats guessing at the regex that's supposed to match them.
+      const rawFields = await page
+        .evaluate(() => {
+          const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+          const labelOf = (el) => {
+            if (el.id) {
+              const lab = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+              if (lab) return norm(lab.textContent);
+            }
+            const cell = el.closest("td");
+            const prev = cell && cell.previousElementSibling;
+            if (prev) return norm(prev.textContent);
+            return null;
+          };
+          const selects = Array.from(document.querySelectorAll("select")).map((s) => ({
+            id: s.id || null,
+            name: s.getAttribute("name") || null,
+            label: labelOf(s),
+            value: s.value,
+            options: Array.from(s.options).map((o) => norm(o.text)),
+          }));
+          const inputs = Array.from(document.querySelectorAll('input[type="text"], textarea')).map((i) => ({
+            id: i.id || null,
+            name: i.getAttribute("name") || null,
+            label: labelOf(i),
+            value: i.value,
+          }));
+          return { selects, inputs };
+        })
+        .catch((err) => ({ error: err.message }));
+      onProgress(100, "Preview ready.");
+      return { details, committed: false, previewImage, rawFields };
+    }
+
+    onProgress(90, "Issuing payment...");
+    const result = await allocateAllAndIssue(page, allocation);
+
+    onProgress(100, result.verified ? "Payment issued." : "Submitted — could not positively confirm from the page.");
+    return { details, committed: true, verified: result.verified, bookingNo: String(bookingNo), reference: String(reference) };
+  } finally {
+    await page?.close().catch(() => {});
+    if (browser && launched) await browser.close().catch(() => {});
+  }
+}
+
 module.exports = {
   readPaymentBooking,
   readCreditorPayment,
+  issueCreditorPayment,
   toAmount,
   getFlow,
   initialsFrom,
